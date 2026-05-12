@@ -468,7 +468,7 @@ EOF
 sshd -t && info "sshd_config прошёл валидацию" || error "Ошибка в sshd_config!"
 
 # Имя службы SSH отличается в зависимости от версии Ubuntu
-if systemctl list-units --type=service --all | grep -q "sshd.service"; then
+if systemctl list-units --type=service --state=running --all | grep -q "sshd.service"; then
     SSH_SERVICE="sshd"
 else
     SSH_SERVICE="ssh"
