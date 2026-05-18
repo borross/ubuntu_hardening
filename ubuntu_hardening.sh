@@ -858,15 +858,35 @@ info "AppArmor: профили переведены в enforce"
 section "15. Настройка sudo"
 
 cat > /etc/sudoers.d/99-hardening << 'EOF'
-Defaults    log_output
-Defaults    logfile=/var/log/sudo.log
+# Тайм-аут sudo-сессии — 5 минут
 Defaults    timestamp_timeout=5
+# Не показывать символы при вводе пароля
 Defaults    !visiblepw
-Defaults    requiretty
+# Фиксированный безопасный PATH — защита от подмены системных утилит
 Defaults    secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 EOF
 chmod 440 /etc/sudoers.d/99-hardening
+
+# Проверяем синтаксис до применения
 visudo -c && info "sudo: конфигурация корректна" || warn "Проверьте sudoers вручную!"
+
+# Логирование sudo через syslog (работает на всех версиях Ubuntu без плагинов)
+# sudo пишет в /var/log/auth.log по умолчанию — дополнительно направляем в отдельный файл
+if ! grep -q "sudo" /etc/rsyslog.d/*.conf 2>/dev/null; then
+    cat > /etc/rsyslog.d/50-sudo.conf << 'RSYSEOF'
+# Логи sudo в отдельный файл
+:programname, isequal, "sudo" /var/log/sudo.log
+& stop
+RSYSEOF
+    systemctl restart rsyslog 2>/dev/null || true
+    info "sudo: логирование через rsyslog -> /var/log/sudo.log"
+fi
+
+# Права на файл лога
+touch /var/log/sudo.log
+chmod 600 /var/log/sudo.log
+
+info "sudo настроен: тайм-аут 5 мин, secure_path, лог -> /var/log/sudo.log"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 16. Политика паролей (PAM / pwquality)
