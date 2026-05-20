@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  Ubuntu Hardening Script — VPS/VDS Edition
-#  Целевая платформа: Ubuntu 22.04 / 24.04 на виртуальном сервере
+#  Целевая платформа: Ubuntu 22.04 / 24.04 / 26.04 на виртуальном сервере
 #  Запускать от root сразу после получения сервера
 #
 #  Использование: bash ubuntu_hardening.sh
@@ -46,6 +46,50 @@ section() { echo -e "\n${CYAN}==================================================
 # 0. Предстартовые проверки
 # ──────────────────────────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && error "Запускайте скрипт от root"
+
+# ── Проверка версии Ubuntu ────────────────────────────────────────────────────
+if [[ ! -f /etc/os-release ]]; then
+    error "Не удалось определить версию ОС (/etc/os-release не найден)"
+fi
+source /etc/os-release
+UBUNTU_VERSION="${VERSION_ID:-unknown}"
+case "${UBUNTU_VERSION}" in
+    22.04|24.04|26.04)
+        info "Версия Ubuntu: ${UBUNTU_VERSION} — поддерживается"
+        ;;
+    *)
+        warn "Версия Ubuntu: ${UBUNTU_VERSION} — не тестировалась"
+        warn "Скрипт написан для 22.04 / 24.04 / 26.04. Продолжить?"
+        read -r -p "  [y/N]: " _ver_confirm
+        [[ "${_ver_confirm}" =~ ^[Yy]$ ]] || error "Прерывание по версии ОС"
+        ;;
+esac
+
+# ── Расчёт лимитов логирования (не более 10% свободного места на диске) ───────
+# Определяем раздел, на котором лежит /var/log
+LOG_PARTITION=$(df --output=target /var/log 2>/dev/null | tail -1 || df /var/log | awk 'NR==2{print $6}')
+# Свободное место в КБ
+FREE_KB=$(df -k "${LOG_PARTITION}" | awk 'NR==2{print $4}')
+# 10% от свободного — в МБ, минимум 50 МБ, максимум 2048 МБ
+LOG_QUOTA_MB=$(( FREE_KB / 10 / 1024 ))
+(( LOG_QUOTA_MB < 50   )) && LOG_QUOTA_MB=50
+(( LOG_QUOTA_MB > 2048 )) && LOG_QUOTA_MB=2048
+
+# Auditd: делим квоту между несколькими файлами ротации (5 файлов)
+AUDIT_NUM_LOGS=5
+AUDIT_MAX_FILE_MB=$(( LOG_QUOTA_MB / AUDIT_NUM_LOGS ))
+(( AUDIT_MAX_FILE_MB < 10 )) && AUDIT_MAX_FILE_MB=10
+
+# Audit backlog: 1 MB RAM ~ 1 запись ~= 256 байт; целевое значение из RAM
+TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+# backlog = RAM_MB * 8, зажато между 8192 и 65536
+AUDIT_BACKLOG=$(( TOTAL_RAM_KB / 1024 * 8 ))
+(( AUDIT_BACKLOG < 8192  )) && AUDIT_BACKLOG=8192
+(( AUDIT_BACKLOG > 65536 )) && AUDIT_BACKLOG=65536
+
+info "Раздел /var/log : ${LOG_PARTITION}, свободно: $(( FREE_KB / 1024 )) МБ"
+info "Квота логов (10%): ${LOG_QUOTA_MB} МБ  |  audit backlog: ${AUDIT_BACKLOG}"
+info "  auditd: ${AUDIT_NUM_LOGS} файлов × ${AUDIT_MAX_FILE_MB} МБ"
 
 # ── Выбор порта SSH ───────────────────────────────────────────────────────────
 echo ""
@@ -783,9 +827,46 @@ info "Core dump отключён"
 # ──────────────────────────────────────────────────────────────────────────────
 section "13. Auditd — аудит системных событий"
 
+# ── auditd.conf — лимиты хранения, рассчитанные из свободного места на диске ──
+mkdir -p /etc/audit
+cat > /etc/audit/auditd.conf << EOF
+# Сгенерировано ubuntu_hardening.sh
+log_file = /var/log/audit/audit.log
+log_format = ENRICHED
+log_group = root
+
+# Ротация: ${AUDIT_NUM_LOGS} файлов по ${AUDIT_MAX_FILE_MB} МБ каждый
+# Итого: ~$(( AUDIT_NUM_LOGS * AUDIT_MAX_FILE_MB )) МБ — не более 10% свободного места
+max_log_file = ${AUDIT_MAX_FILE_MB}
+num_logs = ${AUDIT_NUM_LOGS}
+max_log_file_action = ROTATE
+
+# При нехватке места — не падать, а писать в syslog и удалять старые
+space_left = $(( AUDIT_MAX_FILE_MB * 2 ))
+space_left_action = SYSLOG
+admin_space_left = $(( AUDIT_MAX_FILE_MB ))
+admin_space_left_action = ROTATE
+disk_full_action = ROTATE
+disk_error_action = SYSLOG
+
+# Буфер диспетчера
+disp_qos = lossy
+dispatcher = /sbin/audispd
+name_format = HOSTNAME
+
+# Флаш: каждые 5 секунд или 50 записей
+flush = INCREMENTAL_ASYNC
+freq = 50
+EOF
+
+# ── Правила аудита ─────────────────────────────────────────────────────────────
 cat > /etc/audit/rules.d/99-hardening.rules << EOF
 -D
--b 8192
+# backlog рассчитан из RAM: ${AUDIT_BACKLOG} записей
+# (формула: RAM_MB × 8, диапазон 8192–65536)
+-b ${AUDIT_BACKLOG}
+# --backlog_wait_time: ждать 1 мс перед отбрасыванием события (снижает потери)
+--backlog_wait_time 1
 # Режим сбоя 1 = писать в syslog (не 2/паника — VPS без физического доступа!)
 -f 1
 
@@ -834,8 +915,26 @@ cat > /etc/audit/rules.d/99-hardening.rules << EOF
 -e 2
 EOF
 
+# ── logrotate для /var/log/audit ───────────────────────────────────────────────
+cat > /etc/logrotate.d/audit << EOF
+/var/log/audit/audit.log {
+    daily
+    missingok
+    rotate ${AUDIT_NUM_LOGS}
+    maxsize ${AUDIT_MAX_FILE_MB}M
+    compress
+    delaycompress
+    notifempty
+    create 0600 root root
+    postrotate
+        /sbin/service auditd restart > /dev/null 2>&1 || true
+    endscript
+}
+EOF
+
+mkdir -p /var/log/audit
 service auditd restart 2>/dev/null || systemctl restart auditd
-info "auditd настроен и запущен"
+info "auditd настроен: backlog=${AUDIT_BACKLOG}, ${AUDIT_NUM_LOGS}×${AUDIT_MAX_FILE_MB}МБ (≤10% диска)"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 14. AppArmor
