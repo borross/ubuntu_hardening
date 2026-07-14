@@ -49,7 +49,7 @@
 ## Быстрый старт
 
 ```bash
-wget -O ubuntu_hardening.sh https://your-repo/ubuntu_hardening.sh
+wget -O ubuntu_hardening.sh https://raw.githubusercontent.com/borross/ubuntu_hardening/refs/heads/main/ubuntu_hardening.sh
 less ubuntu_hardening.sh        # проверить содержимое перед запуском
 bash ubuntu_hardening.sh
 ```
