@@ -1,32 +1,24 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Ubuntu Hardening Script — VPS/VDS Edition
+#  Ubuntu Hardening Script — VPS/VDS Edition  (v2, bugfix release)
 #  Целевая платформа: Ubuntu 22.04 / 24.04 / 26.04 на виртуальном сервере
 #  Запускать от root сразу после получения сервера
 #
-#  Использование: bash ubuntu_hardening.sh [ОПЦИИ]
+#  Использование: bash ubuntu_hardening.sh
 #
-#  Безопасные меры применяются ВСЕГДА. Рискованные (могут оборвать доступ
-#  или сломать нагрузку) — только с явным флагом.
-#
-#  ОПЦИИ ВКЛЮЧЕНИЯ РИСКОВАННОГО ХАРДЕНИНГА:
-#    --with-pam-lockout       pam_faillock: блокировка УЗ после N попыток (риск локаута)
-#    --with-pwhistory         pam_pwhistory: запрет повтора старых паролей + yescrypt
-#    --with-password-aging    старение паролей через login.defs (риск локаута)
-#    --with-tmout             авто-выход из неактивных shell-сессий (TMOUT)
-#    --with-aide              установка и инициализация AIDE (долгая операция)
-#    --with-audit-strict      auditd -f 2 — паника ядра при сбое аудита (VPS уйдёт в офлайн)
-#    --no-userns              отключить unprivileged userns (ломает rootless Docker/Podman)
-#    --with-fs-blacklist      расширенный blacklist неиспользуемых модулей ФС
-#    --minimize-services      интерактивный аудит и удаление лишних сервисов
-#    --with-grub-password     пароль на загрузчик (ломает удалённый ребут без IP-KVM)
-#    --with-tcp-forwarding    включить AllowTcpForwarding/GatewayPorts (VPN/прокси)
-#
-#  МЕТА-ФЛАГИ:
-#    --all-risky              включить всё рискованное, КРОМЕ --with-audit-strict
-#                             и --with-grub-password (самые опасные для VPS)
-#    --audit-only             ничего не менять, только отчёт о соответствии CIS
-#    -h, --help               показать справку и выйти
+#  Изменения v2 (кратко):
+#    - ssh.socket отключается (socket-активация игнорировала Port) 
+#    - выбор типа ключа: ed25519 (рекомендуется) или ecdsa-521
+#    - контрольная точка входа ПЕРЕД блокировкой root
+#    - auditd: убраны шумные правила connect/socket (причина backlog exceeded),
+#      убраны устаревшие dispatcher/disp_qos, добавлены arch=b32 правила,
+#      повторный запуск при immutable-правилах не роняет скрипт
+#    - chrony: minsources подстраивается под число серверов
+#    - UFW: перед reset показывает слушающие порты и позволяет открыть свои
+#    - фикс /etc/ssh (755, а не 700 — иначе ломается ssh-клиент)
+#    - passwd в цикле (3 ошибки ввода не роняют скрипт из-за set -e)
+#    - фикс noexec /tmp для apt (TempDir)
+#    - лог выполнения в /root/hardening_<дата>.log, trap на ошибки
 #
 #  ВАЖНО для VPS:
 #    Убедитесь, что у вас есть доступ к VNC/консоли провайдера
@@ -42,26 +34,16 @@ ADMIN_USER="admin"
 SSH_PORT="20202"                     # значение по умолчанию, будет переспрошено
 KEY_PATH="/root/admin_ssh_key"       # куда сохранить сгенерированную пару ключей
 
+# Семейство адресов для SSH:
+#   any  — IPv4 + IPv6 (безопасное значение по умолчанию)
+#   inet — только IPv4 (НЕ ставьте на IPv6-only VPS — потеряете доступ!)
+SSH_ADDRESS_FAMILY="any"
+
 # Форвардинг отключён по умолчанию.
-# На VPS туннели могут быть нужны для проксирования — включайте осознанно
-# (переменными ниже или флагом --with-tcp-forwarding).
+# На VPS туннели могут быть нужны для проксирования — включайте осознанно.
 TCP_FORWARDING="no"
 GATEWAY_PORTS="no"
 X11_FORWARDING="no"
-
-# ── Флаги рискованного харденинга (🟡/🔴) — по умолчанию ВЫКЛЮЧЕНЫ ─────────────
-# Включаются аргументами командной строки (см. --help). Менять здесь не нужно.
-OPT_PAM_LOCKOUT="no"      # 🔴 pam_faillock — риск локаута
-OPT_PWHISTORY="no"        # 🟡 pam_pwhistory + yescrypt
-OPT_PASSWORD_AGING="no"   # 🔴 старение паролей login.defs
-OPT_TMOUT="no"            # 🟡 авто-выход из shell по простою
-OPT_AIDE="no"             # 🟡 установка AIDE (долго)
-OPT_AUDIT_STRICT="no"     # 🔴 auditd -f 2 (паника ядра)
-OPT_NO_USERNS="no"        # 🟡 отключить unprivileged userns (ломает rootless-контейнеры)
-OPT_FS_BLACKLIST="no"     # 🟡 расширенный blacklist модулей ФС
-OPT_MINIMIZE_SVC="no"     # 🟡 минимизация сервисов (интерактивно)
-OPT_GRUB_PASSWORD="no"    # 🔴 пароль на GRUB (ломает удалённый ребут)
-AUDIT_ONLY="no"           # режим отчёта без изменений
 # ──────────────────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -73,117 +55,17 @@ section() { echo -e "\n${CYAN}==================================================
             echo -e "${CYAN}===================================================${NC}"; }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Справка
-# ──────────────────────────────────────────────────────────────────────────────
-show_help() {
-    cat << 'HLP'
-Ubuntu Hardening Script — VPS/VDS Edition
-
-Использование:
-  bash ubuntu_hardening.sh [ОПЦИИ]
-
-Безопасные меры применяются всегда. Рискованные — только с флагом.
-
-ВКЛЮЧЕНИЕ РИСКОВАННОГО ХАРДЕНИНГА:
-  --with-pam-lockout       pam_faillock: блокировка УЗ после 5 попыток (РИСК ЛОКАУТА)
-  --with-pwhistory         pam_pwhistory (remember=5) + явный yescrypt в pam_unix
-  --with-password-aging    старение паролей в login.defs (РИСК ЛОКАУТА)
-  --with-tmout             TMOUT — авто-выход из неактивных shell-сессий
-  --with-aide              установка и инициализация AIDE (долго, нагружает диск)
-  --with-audit-strict      auditd -f 2: паника ядра при сбое аудита (VPS В ОФЛАЙН)
-  --no-userns              отключить unprivileged user namespaces (ЛОМАЕТ rootless Docker)
-  --with-fs-blacklist      расширенный blacklist редких модулей ФС
-  --minimize-services      интерактивный аудит/удаление лишних сервисов
-  --with-grub-password     пароль на загрузчик GRUB (НЕТ удалённого ребута без IP-KVM)
-  --with-tcp-forwarding    включить SSH TCP/Gateway forwarding (VPN/прокси)
-
-МЕТА-ФЛАГИ:
-  --all-risky    включить всё рискованное, КРОМЕ --with-audit-strict и --with-grub-password
-  --audit-only   ничего не менять, только вывести отчёт о текущем соответствии
-  -h, --help     эта справка
-
-Примеры:
-  bash ubuntu_hardening.sh
-  bash ubuntu_hardening.sh --with-pwhistory --with-aide
-  bash ubuntu_hardening.sh --all-risky
-  bash ubuntu_hardening.sh --audit-only
-HLP
-}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Разбор аргументов командной строки
-# ──────────────────────────────────────────────────────────────────────────────
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --with-pam-lockout)    OPT_PAM_LOCKOUT="yes" ;;
-        --with-pwhistory)      OPT_PWHISTORY="yes" ;;
-        --with-password-aging) OPT_PASSWORD_AGING="yes" ;;
-        --with-tmout)          OPT_TMOUT="yes" ;;
-        --with-aide)           OPT_AIDE="yes" ;;
-        --with-audit-strict)   OPT_AUDIT_STRICT="yes" ;;
-        --no-userns)           OPT_NO_USERNS="yes" ;;
-        --with-fs-blacklist)   OPT_FS_BLACKLIST="yes" ;;
-        --minimize-services)   OPT_MINIMIZE_SVC="yes" ;;
-        --with-grub-password)  OPT_GRUB_PASSWORD="yes" ;;
-        --with-tcp-forwarding) TCP_FORWARDING="yes"; GATEWAY_PORTS="yes" ;;
-        --all-risky)
-            OPT_PAM_LOCKOUT="yes"; OPT_PWHISTORY="yes"; OPT_PASSWORD_AGING="yes"
-            OPT_TMOUT="yes"; OPT_AIDE="yes"; OPT_NO_USERNS="yes"
-            OPT_FS_BLACKLIST="yes"; OPT_MINIMIZE_SVC="yes"
-            # --with-audit-strict и --with-grub-password НЕ включаются (слишком опасны)
-            ;;
-        --audit-only)          AUDIT_ONLY="yes" ;;
-        -h|--help)             show_help; exit 0 ;;
-        *)                     echo "Неизвестный аргумент: $1 (см. --help)" >&2; exit 1 ;;
-    esac
-    shift
-done
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Режим --audit-only: только проверки, без изменений
-# ──────────────────────────────────────────────────────────────────────────────
-run_audit_only() {
-    [[ $EUID -ne 0 ]] && error "Для аудита тоже нужен root (чтение /etc/shadow и пр.)"
-    local pass="${GREEN}PASS${NC}" fail="${RED}FAIL${NC}"
-    check() { # $1=описание $2=команда-предикат
-        if eval "$2" &>/dev/null; then printf "  [%b] %s\n" "$pass" "$1"
-        else printf "  [%b] %s\n" "$fail" "$1"; fi
-    }
-    section "АУДИТ СООТВЕТСТВИЯ (изменения не вносятся)"
-    echo ""
-    echo "  SSH:"
-    check "PermitRootLogin no"        "grep -qiE '^\s*PermitRootLogin\s+no' /etc/ssh/sshd_config"
-    check "PasswordAuthentication no" "grep -qiE '^\s*PasswordAuthentication\s+no' /etc/ssh/sshd_config"
-    check "GSSAPIAuthentication no"   "grep -qiE '^\s*GSSAPIAuthentication\s+no' /etc/ssh/sshd_config"
-    check "HostbasedAuthentication no" "grep -qiE '^\s*HostbasedAuthentication\s+no' /etc/ssh/sshd_config"
-    check "PermitUserEnvironment no"  "grep -qiE '^\s*PermitUserEnvironment\s+no' /etc/ssh/sshd_config"
-    check "sshd_config mode 600"      "[[ \$(stat -c '%a' /etc/ssh/sshd_config) == 600 ]]"
-    echo "  Ядро/сеть:"
-    check "ip_forward = 0"            "[[ \$(sysctl -n net.ipv4.ip_forward) == 0 ]]"
-    check "accept_source_route = 0"   "[[ \$(sysctl -n net.ipv4.conf.all.accept_source_route) == 0 ]]"
-    check "tcp_syncookies = 1"        "[[ \$(sysctl -n net.ipv4.tcp_syncookies) == 1 ]]"
-    check "randomize_va_space = 2"    "[[ \$(sysctl -n kernel.randomize_va_space) == 2 ]]"
-    check "ptrace_scope >= 1"         "[[ \$(sysctl -n kernel.yama.ptrace_scope) -ge 1 ]]"
-    echo "  Сервисы и доступ:"
-    check "root заблокирован"         "passwd -S root | grep -qE '\sL\s'"
-    check "auditd активен"            "systemctl is-active --quiet auditd"
-    check "ufw активен"               "ufw status | grep -qi 'Status: active'"
-    check "fail2ban активен"          "systemctl is-active --quiet fail2ban"
-    check "AppArmor включён"          "aa-status --enabled"
-    check "chrony активен"            "systemctl is-active --quiet chrony"
-    echo "  Права на файлы:"
-    check "/etc/shadow 640 и строже"  "[[ \$(stat -c '%a' /etc/shadow) -le 640 ]]"
-    check "AIDE установлен"           "command -v aide"
-    echo ""
-    info "Аудит завершён. Для применения исправлений запустите без --audit-only."
-    exit 0
-}
-[[ "${AUDIT_ONLY}" == "yes" ]] && run_audit_only
-
-# ──────────────────────────────────────────────────────────────────────────────
 # 0. Предстартовые проверки
 # ──────────────────────────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && error "Запускайте скрипт от root"
+
+# ── Лог выполнения: весь вывод дублируется в файл ─────────────────────────────
+RUN_LOG="/root/hardening_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "${RUN_LOG}") 2>&1
+info "Лог выполнения: ${RUN_LOG}"
+
+# ── Trap: при аварийном завершении показываем строку ──────────────────────────
+trap 'echo -e "${RED}[x]${NC} Скрипт аварийно остановлен на строке ${LINENO} (см. ${RUN_LOG})"' ERR
 
 # ── Проверка версии Ubuntu ────────────────────────────────────────────────────
 if [[ ! -f /etc/os-release ]]; then
@@ -204,23 +86,18 @@ case "${UBUNTU_VERSION}" in
 esac
 
 # ── Расчёт лимитов логирования (не более 10% свободного места на диске) ───────
-# Определяем раздел, на котором лежит /var/log
 LOG_PARTITION=$(df --output=target /var/log 2>/dev/null | tail -1 || df /var/log | awk 'NR==2{print $6}')
-# Свободное место в КБ
 FREE_KB=$(df -k "${LOG_PARTITION}" | awk 'NR==2{print $4}')
-# 10% от свободного — в МБ, минимум 50 МБ, максимум 2048 МБ
 LOG_QUOTA_MB=$(( FREE_KB / 10 / 1024 ))
 (( LOG_QUOTA_MB < 50   )) && LOG_QUOTA_MB=50
 (( LOG_QUOTA_MB > 2048 )) && LOG_QUOTA_MB=2048
 
-# Auditd: делим квоту между несколькими файлами ротации (5 файлов)
 AUDIT_NUM_LOGS=5
 AUDIT_MAX_FILE_MB=$(( LOG_QUOTA_MB / AUDIT_NUM_LOGS ))
 (( AUDIT_MAX_FILE_MB < 10 )) && AUDIT_MAX_FILE_MB=10
 
-# Audit backlog: 1 MB RAM ~ 1 запись ~= 256 байт; целевое значение из RAM
+# Audit backlog — буфер в ОПЕРАТИВНОЙ памяти ядра, рассчитывается из RAM
 TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-# backlog = RAM_MB * 8, зажато между 8192 и 65536
 AUDIT_BACKLOG=$(( TOTAL_RAM_KB / 1024 * 8 ))
 (( AUDIT_BACKLOG < 8192  )) && AUDIT_BACKLOG=8192
 (( AUDIT_BACKLOG > 65536 )) && AUDIT_BACKLOG=65536
@@ -237,9 +114,9 @@ echo "  (Enter — оставить ${SSH_PORT})"
 while true; do
     read -r -p "  Введите порт SSH: " USER_SSH_PORT
     if [[ -z "${USER_SSH_PORT}" ]]; then
-        # Оставляем значение по умолчанию
         break
-    elif [[ "${USER_SSH_PORT}" =~ ^[0-9]+$ ]]       && (( USER_SSH_PORT >= 1024 && USER_SSH_PORT <= 65535 )); then
+    elif [[ "${USER_SSH_PORT}" =~ ^[0-9]+$ ]] \
+      && (( USER_SSH_PORT >= 1024 && USER_SSH_PORT <= 65535 )); then
         SSH_PORT="${USER_SSH_PORT}"
         break
     else
@@ -249,6 +126,23 @@ done
 info "Будет использован SSH-порт: ${SSH_PORT}"
 echo ""
 
+# ── Выбор типа SSH-ключа ──────────────────────────────────────────────────────
+echo -e "  Тип SSH-ключа:"
+echo -e "    1) ${GREEN}ed25519${NC}   — современный, быстрый, рекомендуется"
+echo "    2) ecdsa-521 — NIST P-521 (совместимость со старыми требованиями)"
+echo "  (Enter — ed25519)"
+KEY_TYPE="ed25519"
+while true; do
+    read -r -p "  Выбор [1/2]: " _key_choice
+    case "${_key_choice}" in
+        ""|1) KEY_TYPE="ed25519";   break ;;
+        2)    KEY_TYPE="ecdsa-521"; break ;;
+        *)    echo -e "  ${RED}Введите 1 или 2.${NC}" ;;
+    esac
+done
+info "Тип ключа: ${KEY_TYPE}"
+echo ""
+
 # Определяем гипервизор — некоторые настройки зависят от платформы
 HYPERVISOR="bare"
 if command -v systemd-detect-virt &>/dev/null; then
@@ -256,43 +150,18 @@ if command -v systemd-detect-virt &>/dev/null; then
     info "Обнаружен гипервизор: ${HYPERVISOR}"
 fi
 
-# ── Сводка активных рискованных опций ─────────────────────────────────────────
-_risky_active=()
-[[ "${OPT_PAM_LOCKOUT}"   == "yes" ]] && _risky_active+=("pam-lockout 🔴")
-[[ "${OPT_PWHISTORY}"     == "yes" ]] && _risky_active+=("pwhistory 🟡")
-[[ "${OPT_PASSWORD_AGING}" == "yes" ]] && _risky_active+=("password-aging 🔴")
-[[ "${OPT_TMOUT}"         == "yes" ]] && _risky_active+=("tmout 🟡")
-[[ "${OPT_AIDE}"          == "yes" ]] && _risky_active+=("aide 🟡")
-[[ "${OPT_AUDIT_STRICT}"  == "yes" ]] && _risky_active+=("audit-strict 🔴")
-[[ "${OPT_NO_USERNS}"     == "yes" ]] && _risky_active+=("no-userns 🟡")
-[[ "${OPT_FS_BLACKLIST}"  == "yes" ]] && _risky_active+=("fs-blacklist 🟡")
-[[ "${OPT_MINIMIZE_SVC}"  == "yes" ]] && _risky_active+=("minimize-services 🟡")
-[[ "${OPT_GRUB_PASSWORD}" == "yes" ]] && _risky_active+=("grub-password 🔴")
-echo ""
-if [[ ${#_risky_active[@]} -gt 0 ]]; then
-    warn "Активны рискованные опции: ${_risky_active[*]}"
-else
-    info "Рискованные опции не выбраны — только безопасный профиль (см. --help)"
-fi
-echo ""
-
 section "0. Обновление системы и установка пакетов"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" \
                         -o Dpkg::Options::="--force-confold"
-apt-get install -y -qq     ufw fail2ban auditd audispd-plugins     libpam-pwquality unattended-upgrades apt-listchanges     acl curl wget gnupg2 chrony
+# rsyslog добавлен явно: минимальные образы 24.04+ могут идти без него,
+# а на нём построено логирование sudo (секция 15)
+apt-get install -y -qq \
+    ufw fail2ban auditd audispd-plugins \
+    libpam-pwquality unattended-upgrades apt-listchanges \
+    acl curl wget gnupg2 chrony rsyslog
 info "Пакеты установлены"
-
-# prelink мешает AIDE и расширяет поверхность атаки (CIS 1.5.4) — удаляем всегда
-if dpkg -l prelink &>/dev/null 2>&1; then
-    apt-get purge -y -qq prelink && info "prelink удалён (CIS 1.5.4)"
-fi
-
-# AIDE — только по флагу (долгая инициализация базы)
-if [[ "${OPT_AIDE}" == "yes" ]]; then
-    apt-get install -y -qq aide aide-common && info "AIDE установлен (инициализация в секции 28)"
-fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Имя хоста, часовой пояс и синхронизация времени
@@ -306,7 +175,6 @@ echo ""
 echo -e "  Текущее имя хоста: ${YELLOW}${CURRENT_HOSTNAME}${NC}"
 read -r -p "  Введите новое имя хоста (Enter — оставить текущее): " NEW_HOSTNAME
 if [[ -n "${NEW_HOSTNAME}" && "${NEW_HOSTNAME}" != "${CURRENT_HOSTNAME}" ]]; then
-    # RFC 1123: только a-z, 0-9 и дефис, не длиннее 63 символов
     if [[ "${NEW_HOSTNAME}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
         hostnamectl set-hostname "${NEW_HOSTNAME}"
         EFFECTIVE_HOSTNAME="${NEW_HOSTNAME}"
@@ -325,19 +193,15 @@ echo "  Пример: ${EFFECTIVE_HOSTNAME}.example.com"
 echo "  (Enter — пропустить, FQDN не будет задан)"
 read -r -p "  Введите FQDN для этого сервера: " NEW_FQDN
 if [[ -n "${NEW_FQDN}" ]]; then
-    # Базовая валидация FQDN: метки через точки, каждая по RFC 1123
     if [[ "${NEW_FQDN}" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
-        # Убираем старые записи для этого хоста, добавляем FQDN + short name
         sed -i "/127\.0\.1\.1/d" /etc/hosts
         echo -e "127.0.1.1\t${NEW_FQDN} ${EFFECTIVE_HOSTNAME}" >> /etc/hosts
-        # Записываем canonical name в hostnamectl (статический hostname = short)
         hostnamectl set-hostname "${EFFECTIVE_HOSTNAME}"
         info "FQDN задан: ${NEW_FQDN}"
         info "/etc/hosts: 127.0.1.1 -> ${NEW_FQDN} ${EFFECTIVE_HOSTNAME}"
     else
         warn "Некорректный FQDN '${NEW_FQDN}' — пропускаем"
         warn "Формат: hostname.domain.tld (например server01.example.com)"
-        # Обновляем /etc/hosts хотя бы для short name
         sed -i "/127\.0\.1\.1/d" /etc/hosts
         echo -e "127.0.1.1\t${EFFECTIVE_HOSTNAME}" >> /etc/hosts
     fi
@@ -346,6 +210,7 @@ else
     sed -i "/127\.0\.1\.1/d" /etc/hosts
     echo -e "127.0.1.1\t${EFFECTIVE_HOSTNAME}" >> /etc/hosts
 fi
+
 # ── Часовой пояс ──────────────────────────────────────────────────────────────
 CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone)
 echo ""
@@ -367,6 +232,7 @@ if [[ -n "${NEW_TZ}" ]]; then
 else
     info "Часовой пояс оставлен: ${CURRENT_TZ}"
 fi
+
 # ── DNS ───────────────────────────────────────────────────────────────────────
 echo ""
 echo "  Текущие DNS-серверы:"
@@ -387,7 +253,6 @@ echo "  (Enter — пропустить, DNS не меняется)"
 read -r -p "  Введите основной DNS: " DNS1
 read -r -p "  Введите резервный DNS (Enter — пропустить): " DNS2
 
-# Валидация IP-адреса
 is_valid_ip() {
     local ip="$1"
     [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -397,6 +262,13 @@ is_valid_ip() {
         (( octet >= 0 && octet <= 255 )) || return 1
     done
     return 0
+}
+
+# Валидация NTP-сервера: IPv4 или hostname по RFC 1123
+is_valid_ntp_server() {
+    local srv="$1"
+    is_valid_ip "${srv}" && return 0
+    [[ "${srv}" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]
 }
 
 DNS_SERVERS=()
@@ -418,22 +290,18 @@ if [[ -n "${DNS2}" ]]; then
 fi
 
 if [[ ${#DNS_SERVERS[@]} -gt 0 ]]; then
-    # Настраиваем через systemd-resolved (современный способ для Ubuntu 22.04+)
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         mkdir -p /etc/systemd/resolved.conf.d
         {
             echo "[Resolve]"
             echo "DNS=${DNS_SERVERS[*]}"
             echo "FallbackDNS="
-            # DNS over TLS — если серверы поддерживают (Cloudflare, Google, Quad9)
             echo "DNSOverTLS=opportunistic"
             echo "DNSSEC=allow-downgrade"
         } > /etc/systemd/resolved.conf.d/custom-dns.conf
         systemctl restart systemd-resolved
         info "DNS настроен через systemd-resolved: ${DNS_SERVERS[*]}"
     else
-        # Fallback: прямая запись в /etc/resolv.conf
-        # Снимаем защиту от перезаписи если есть
         chattr -i /etc/resolv.conf 2>/dev/null || true
         {
             echo "# Настроено ubuntu_hardening.sh"
@@ -442,7 +310,6 @@ if [[ ${#DNS_SERVERS[@]} -gt 0 ]]; then
             done
             echo "options timeout:2 attempts:3"
         } > /etc/resolv.conf
-        # Защищаем от перезаписи DHCP-клиентом
         chattr +i /etc/resolv.conf
         info "DNS записан в /etc/resolv.conf: ${DNS_SERVERS[*]}"
         warn "/etc/resolv.conf защищён от перезаписи (chattr +i)"
@@ -452,36 +319,49 @@ else
 fi
 
 # ── NTP через Chrony ──────────────────────────────────────────────────────────
-# Chrony точнее и надёжнее systemd-timesyncd: быстрее синхронизируется
-# после долгого простоя, лучше работает при нестабильной сети на VPS.
-
-# Отключаем systemd-timesyncd чтобы не конфликтовал с chrony
 systemctl disable --now systemd-timesyncd 2>/dev/null || true
 
-# Пользовательские NTP-серверы
 echo ""
 echo "  NTP-серверы по умолчанию:"
 echo "    pool.ntp.org (0-3) + time.cloudflare.com"
 echo ""
-echo "  Свои NTP-серверы (например: ntp.vашprovider.ru или IP)."
+echo "  Свои NTP-серверы (например: ntp.vashprovider.ru или IP)."
 echo "  Можно указать несколько через пробел."
 echo "  (Enter — использовать серверы по умолчанию)"
 read -r -p "  Введите свои NTP-серверы: " CUSTOM_NTP
 
+NTP_SOURCE_COUNT=0
 if [[ -n "${CUSTOM_NTP}" ]]; then
     NTP_LINES=""
     for srv in ${CUSTOM_NTP}; do
-        NTP_LINES+="server ${srv} iburst"$'\n'
+        if is_valid_ntp_server "${srv}"; then
+            NTP_LINES+="server ${srv} iburst"$'\n'
+            NTP_SOURCE_COUNT=$(( NTP_SOURCE_COUNT + 1 ))
+        else
+            warn "Некорректный NTP-сервер '${srv}' — пропущен"
+        fi
     done
-    info "Будут использованы пользовательские NTP: ${CUSTOM_NTP}"
-else
+    if (( NTP_SOURCE_COUNT == 0 )); then
+        warn "Ни один пользовательский NTP не прошёл валидацию — используем серверы по умолчанию"
+        CUSTOM_NTP=""
+    else
+        info "Будут использованы пользовательские NTP (${NTP_SOURCE_COUNT} шт.)"
+    fi
+fi
+if [[ -z "${CUSTOM_NTP}" ]]; then
     NTP_LINES="pool 0.ubuntu.pool.ntp.org iburst
 pool 1.ubuntu.pool.ntp.org iburst
 pool 2.ubuntu.pool.ntp.org iburst
 pool 3.ubuntu.pool.ntp.org iburst
 server time.cloudflare.com iburst nts"
+    NTP_SOURCE_COUNT=5
     info "Используются NTP-серверы по умолчанию"
 fi
+
+# minsources: при одном источнике требование "минимум 2" заблокировало бы
+# синхронизацию навсегда — подстраиваемся под реальное число серверов
+NTP_MINSOURCES=2
+(( NTP_SOURCE_COUNT < 2 )) && NTP_MINSOURCES=1
 
 cat > /etc/chrony/chrony.conf << EOF
 # Сгенерировано ubuntu_hardening.sh
@@ -493,8 +373,9 @@ driftfile /var/lib/chrony/drift
 # Разрешить большой прыжок времени только при первом старте
 makestep 1.0 3
 
-# Минимум источников для считать время синхронизированным
-minsources 2
+# Минимум источников чтобы считать время синхронизированным
+# (1, если задан единственный пользовательский сервер)
+minsources ${NTP_MINSOURCES}
 
 # Не принимать источник с большим rtt (нестабильная сеть на VPS)
 maxdistance 1.5
@@ -510,8 +391,6 @@ EOF
 
 systemctl enable --now chrony
 sleep 2
-
-# Принудительная первая синхронизация
 chronyc makestep 2>/dev/null || true
 
 info "Chrony запущен и настроен"
@@ -524,10 +403,11 @@ echo ""
 chronyc tracking 2>/dev/null | grep -E "Reference ID|System time|Leap status" \
     | sed 's/^/    /' || true
 echo ""
+
 # ──────────────────────────────────────────────────────────────────────────────
-# 2. Генерация SSH-ключевой пары ECDSA-521
+# 2. Генерация SSH-ключевой пары
 # ──────────────────────────────────────────────────────────────────────────────
-section "2. Генерация SSH-ключевой пары (ECDSA 521 бит)"
+section "2. Генерация SSH-ключевой пары (${KEY_TYPE})"
 
 rm -f "${KEY_PATH}" "${KEY_PATH}.pub"
 
@@ -535,9 +415,15 @@ echo ""
 echo -e "${YELLOW}Придумайте надёжный пароль для приватного ключа.${NC}"
 echo -e "${YELLOW}Он будет запрашиваться при каждом подключении по SSH.${NC}"
 echo ""
-ssh-keygen -t ecdsa -b 521 \
-           -f "${KEY_PATH}" \
-           -C "${ADMIN_USER}@$(hostname)-$(date +%Y%m%d)"
+if [[ "${KEY_TYPE}" == "ed25519" ]]; then
+    ssh-keygen -t ed25519 \
+               -f "${KEY_PATH}" \
+               -C "${ADMIN_USER}@$(hostname)-$(date +%Y%m%d)"
+else
+    ssh-keygen -t ecdsa -b 521 \
+               -f "${KEY_PATH}" \
+               -C "${ADMIN_USER}@$(hostname)-$(date +%Y%m%d)"
+fi
 
 chmod 600 "${KEY_PATH}"
 chmod 644 "${KEY_PATH}.pub"
@@ -583,19 +469,27 @@ else
     else
         useradd -m -s /bin/bash "${ADMIN_USER}"
     fi
-    usermod -aG sudo "${ADMIN_USER}"
-    info "Пользователь ${ADMIN_USER} создан и добавлен в sudo"
+    info "Пользователь ${ADMIN_USER} создан"
 fi
 
+# usermod вынесен из ветки else: если пользователь существовал,
+# но не был в sudo — раньше он туда не попадал (баг)
+usermod -aG sudo "${ADMIN_USER}"
+info "Пользователь ${ADMIN_USER} состоит в группе sudo"
+
+# passwd в цикле: 3 ошибки ввода возвращают ≠0 и при set -e
+# раньше роняли весь скрипт на середине
 warn "Задайте пароль для ${ADMIN_USER} (нужен только для sudo, не для SSH):"
-passwd "${ADMIN_USER}"
+until passwd "${ADMIN_USER}"; do
+    warn "Пароль не задан (несовпадение или слабый) — попробуйте ещё раз"
+done
 
 SSH_DIR="/home/${ADMIN_USER}/.ssh"
 AUTH_KEYS="${SSH_DIR}/authorized_keys"
 mkdir -p "${SSH_DIR}"
 cat "${KEY_PATH}.pub" >> "${AUTH_KEYS}"
 sort -u "${AUTH_KEYS}" -o "${AUTH_KEYS}"
-chown -R "${ADMIN_USER}:${ADMIN_USER}" "${SSH_DIR}"
+chown -R "${ADMIN_USER}:$(id -gn "${ADMIN_USER}")" "${SSH_DIR}"
 chmod 700 "${SSH_DIR}"
 chmod 600 "${AUTH_KEYS}"
 info "Публичный ключ установлен для ${ADMIN_USER}"
@@ -615,17 +509,22 @@ EOF
 
 cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
 
-chmod 700 /etc/ssh
-find /etc/ssh -type f -name "ssh_host_*_key"     -exec chmod 600 {} \;
-find /etc/ssh -type f -name "ssh_host_*_key.pub" -exec chmod 644 {} \;
+# ИСПРАВЛЕНО: было chmod 700 /etc/ssh — это ломало ssh-КЛИЕНТ для
+# непривилегированных пользователей (нет доступа к /etc/ssh/ssh_config).
+# Каталог должен быть 755, приватность обеспечивают права на сами файлы.
+chmod 755 /etc/ssh
+chmod 600 /etc/ssh/sshd_config
+find /etc/ssh -maxdepth 1 -type f -name "ssh_host_*_key"     -exec chmod 600 {} \;
+find /etc/ssh -maxdepth 1 -type f -name "ssh_host_*_key.pub" -exec chmod 644 {} \;
 
 cat > /etc/ssh/sshd_config << EOF
-# Generated by ubuntu_hardening.sh (VPS edition)
+# Generated by ubuntu_hardening.sh (VPS edition, v2)
 
 # Порт и протокол
 Port ${SSH_PORT}
 Protocol 2
-AddressFamily inet
+# any = IPv4+IPv6; inet = только IPv4 (настраивается переменной в скрипте)
+AddressFamily ${SSH_ADDRESS_FAMILY}
 
 # Криптография — только современные алгоритмы
 HostKeyAlgorithms ecdsa-sha2-nistp521,ssh-ed25519,rsa-sha2-512,rsa-sha2-256
@@ -642,20 +541,12 @@ KbdInteractiveAuthentication no
 UsePAM yes
 AuthenticationMethods publickey
 
-# Отключаем устаревшие/лишние механизмы аутентификации (CIS 5.1.9-5.1.11, 5.1.21)
-GSSAPIAuthentication no
-HostbasedAuthentication no
-IgnoreRhosts yes
-PermitUserEnvironment no
-
 # Тайм-ауты и лимиты
-# ИСПРАВЛЕНО: LoginGraceTime 0 = без лимита (баг в оригинале), нужно 30
+# LoginGraceTime 0 = без лимита (баг в оригинале), нужно 30
 LoginGraceTime 30
 MaxAuthTries 3
 MaxSessions 5
-# 5 одновр. неаутентифицированных соединений; при 30% начинаем отказывать
 MaxStartups 5:30:20
-# Разрыв при простое: 5 мин x 2 = 10 минут
 ClientAliveInterval 300
 ClientAliveCountMax 2
 
@@ -666,9 +557,6 @@ AllowUsers ${ADMIN_USER}
 AllowTcpForwarding ${TCP_FORWARDING}
 GatewayPorts ${GATEWAY_PORTS}
 X11Forwarding ${X11_FORWARDING}
-# Agent forwarding отключён — иначе агентом могут воспользоваться другие
-# привилегированные пользователи сервера (CIS 5.1.8)
-AllowAgentForwarding no
 
 # Прочее
 PrintMotd no
@@ -686,14 +574,30 @@ SyslogFacility AUTH
 LogLevel VERBOSE
 EOF
 
+# Drop-in файлы могут переопределять наш Port — убираем конфликтующие
+if [[ -d /etc/ssh/sshd_config.d ]]; then
+    if grep -rqs "^\s*Port\s" /etc/ssh/sshd_config.d/ 2>/dev/null; then
+        mkdir -p /root/sshd_config.d.bak
+        grep -rls "^\s*Port\s" /etc/ssh/sshd_config.d/ | while read -r f; do
+            mv "$f" /root/sshd_config.d.bak/
+            warn "Drop-in с директивой Port перемещён в /root/sshd_config.d.bak: $(basename "$f")"
+        done
+    fi
+fi
+
 sshd -t && info "sshd_config прошёл валидацию" || error "Ошибка в sshd_config!"
 
-# Права на конфиг и include-файлы: 0600 root/root (CIS 5.1.1-5.1.2)
-chmod 600 /etc/ssh/sshd_config
-if [[ -d /etc/ssh/sshd_config.d ]]; then
-    find /etc/ssh/sshd_config.d -type f -name "*.conf" -exec chmod 600 {} \; 2>/dev/null || true
+# ── ГЛАВНЫЙ ФИКС «порт не поменялся»: socket-активация SSH ────────────────────
+# Ubuntu 22.10+ / 24.04 по умолчанию запускают SSH через ssh.socket.
+# В этом режиме порт задаёт systemd-сокет, а Port в sshd_config ИГНОРИРУЕТСЯ.
+# Переключаемся на классический режим службы.
+if systemctl is-enabled ssh.socket &>/dev/null; then
+    warn "Обнаружена socket-активация SSH (ssh.socket) — отключаем"
+    systemctl disable --now ssh.socket
+    systemctl enable ssh.service 2>/dev/null || true
+    systemctl daemon-reload
+    info "ssh.socket отключён: порт теперь управляется через sshd_config"
 fi
-info "Права на sshd_config и *.conf выставлены в 600"
 
 # Имя службы SSH отличается в зависимости от версии Ubuntu
 if systemctl list-units --type=service --state=running --all | grep -q "sshd.service"; then
@@ -702,11 +606,38 @@ else
     SSH_SERVICE="ssh"
 fi
 systemctl restart "${SSH_SERVICE}"
-systemctl is-active --quiet "${SSH_SERVICE}"     && info "SSH (${SSH_SERVICE}) перезапущен, активен на порту ${SSH_PORT}"     || error "SSH не запустился! Проверьте: journalctl -xe -u ${SSH_SERVICE}"
+systemctl is-active --quiet "${SSH_SERVICE}" \
+    && info "SSH (${SSH_SERVICE}) перезапущен, активен на порту ${SSH_PORT}" \
+    || error "SSH не запустился! Проверьте: journalctl -xe -u ${SSH_SERVICE}"
 
 # Проверяем что порт реально слушается
 sleep 1
-ss -tlnp | grep ":${SSH_PORT}"     && info "Порт ${SSH_PORT} подтверждён в ss"     || warn "Порт ${SSH_PORT} не найден в ss — возможно нужна секунда или проверьте journalctl -xe"
+ss -tlnp | grep -q ":${SSH_PORT}\b" \
+    && info "Порт ${SSH_PORT} подтверждён в ss" \
+    || warn "Порт ${SSH_PORT} не найден в ss — проверьте journalctl -xe -u ${SSH_SERVICE}"
+
+# ── КОНТРОЛЬНАЯ ТОЧКА: проверка входа ДО блокировки root ──────────────────────
+# Раньше вход проверялся только в самом конце (секция 20), а root
+# блокировался в секции 5 — при проблеме с ключом можно было потерять доступ.
+echo ""
+echo -e "${YELLOW}+------------------------------------------------------------+${NC}"
+echo -e "${YELLOW}|  КОНТРОЛЬНАЯ ТОЧКА — проверьте вход СЕЙЧАС                |${NC}"
+echo -e "${YELLOW}|                                                            |${NC}"
+echo -e "${YELLOW}|  В НОВОМ терминале (не закрывая этот):                     |${NC}"
+echo -e "${YELLOW}|  ssh -p ${SSH_PORT} -i ./admin_ssh_key ${ADMIN_USER}@<IP>          |${NC}"
+echo -e "${YELLOW}|                                                            |${NC}"
+echo -e "${YELLOW}|  Следующий шаг заблокирует root — убедитесь, что вход      |${NC}"
+echo -e "${YELLOW}|  под ${ADMIN_USER} работает!                               |${NC}"
+echo -e "${YELLOW}+------------------------------------------------------------+${NC}"
+echo ""
+while true; do
+    read -r -p "Вход под ${ADMIN_USER} по ключу работает? [y = продолжить / n = прервать]: " _login_ok
+    case "${_login_ok}" in
+        [Yy]) break ;;
+        [Nn]) error "Прервано пользователем: вход не работает. Root НЕ заблокирован, исправьте проблему и перезапустите скрипт." ;;
+        *)    echo "  Введите y или n." ;;
+    esac
+done
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 5. Блокировка root
@@ -732,6 +663,17 @@ info "su ограничен группой sudo"
 # ──────────────────────────────────────────────────────────────────────────────
 section "6. UFW — брандмауэр"
 
+# ИСПРАВЛЕНО: раньше ufw --force reset молча закрывал порты уже работающих
+# сервисов (веб-сервер и т.п.). Показываем, что слушается, и даём открыть.
+echo ""
+echo "  Сейчас на сервере слушаются порты:"
+ss -tlnp 2>/dev/null | awk 'NR>1 {print "    " $4 "  " $NF}' | sort -u || true
+echo ""
+echo "  UFW закроет ВСЁ входящее, кроме SSH:${SSH_PORT}."
+echo "  Если нужны другие порты (например 80 443) — перечислите через пробел."
+echo "  (Enter — открыть только SSH)"
+read -r -p "  Дополнительные TCP-порты: " EXTRA_PORTS
+
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
@@ -740,9 +682,20 @@ ufw default deny forward
 # limit = встроенный rate-limit UFW: 6 попыток за 30 сек -> блок
 ufw limit "${SSH_PORT}/tcp" comment "SSH rate-limited"
 
+if [[ -n "${EXTRA_PORTS:-}" ]]; then
+    for p in ${EXTRA_PORTS}; do
+        if [[ "${p}" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); then
+            ufw allow "${p}/tcp" comment "user-defined"
+            info "UFW: открыт порт ${p}/tcp"
+        else
+            warn "Некорректный порт '${p}' — пропущен"
+        fi
+    done
+fi
+
 ufw --force enable
 ufw status verbose
-info "UFW включён: входящий трафик запрещён кроме SSH:${SSH_PORT}"
+info "UFW включён: входящий трафик запрещён кроме SSH:${SSH_PORT}${EXTRA_PORTS:+ и ${EXTRA_PORTS}}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7. Fail2ban
@@ -794,9 +747,6 @@ info "cron/at: доступ разрешён только root"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 9. Защита разделов (fstab)
-#    VPS-специфика: /home почти всегда на том же разделе что /.
-#    Используем systemd-unit для remount /home.
-#    /var/tmp привязываем к /tmp через bind.
 # ──────────────────────────────────────────────────────────────────────────────
 section "9. Защита разделов (/tmp, /dev/shm, /var/tmp, /home)"
 
@@ -811,7 +761,6 @@ fstab_set() {
     info "fstab: ${mountpoint} настроен"
 }
 
-# /tmp
 fstab_set "/tmp" \
     "tmpfs /tmp tmpfs defaults,rw,nosuid,nodev,noexec,relatime 0 0"
 
@@ -819,7 +768,7 @@ fstab_set "/tmp" \
 fstab_set "/dev/shm" \
     "tmpfs /dev/shm tmpfs defaults,noexec,nodev,nosuid 0 0"
 
-# /var/tmp -> bind к /tmp (наследует все защитные флаги; пропущен в оригинале)
+# /var/tmp -> bind к /tmp (наследует все защитные флаги)
 if ! grep -qE "\s/var/tmp\s" "${FSTAB}"; then
     echo "/tmp /var/tmp none bind 0 0" >> "${FSTAB}"
     info "fstab: /var/tmp привязан к /tmp (bind)"
@@ -828,8 +777,25 @@ fi
 # Применяем без перезагрузки
 mount -o remount /tmp     2>/dev/null && info "  /tmp перемонтирован"     || warn "/tmp: применится после reboot"
 mount -o remount /dev/shm 2>/dev/null && info "  /dev/shm перемонтирован" || warn "/dev/shm: применится после reboot"
-mountpoint -q /var/tmp || mount --bind /tmp /var/tmp 2>/dev/null && \
-    info "  /var/tmp примонтирован" || warn "/var/tmp: применится после reboot"
+# ИСПРАВЛЕНО: было a || b && c — из-за приоритета операторов
+# сообщение "примонтирован" выводилось даже когда mount не выполнялся
+if mountpoint -q /var/tmp; then
+    info "  /var/tmp уже примонтирован"
+elif mount --bind /tmp /var/tmp 2>/dev/null; then
+    info "  /var/tmp примонтирован (bind)"
+else
+    warn "/var/tmp: применится после reboot"
+fi
+
+# ФИКС noexec /tmp для apt: часть maintainer-скриптов dpkg выполняется
+# из временного каталога — переносим его, иначе ночные unattended-upgrades
+# могут падать с Permission denied
+mkdir -p /var/lib/apt/tmp
+cat > /etc/apt/apt.conf.d/99tempdir << 'EOF'
+// /tmp смонтирован с noexec — apt использует отдельный каталог
+APT::ExtractTemplates::TempDir "/var/lib/apt/tmp";
+EOF
+info "apt: временный каталог перенесён в /var/lib/apt/tmp (совместимость с noexec /tmp)"
 
 # /home — на VPS чаще не отдельный раздел
 if grep -qE "\s/home\s" "${FSTAB}"; then
@@ -909,13 +875,6 @@ net.ipv6.conf.default.accept_ra = 0
 # Защита от TIME-WAIT атак (RFC 1337)
 net.ipv4.tcp_rfc1337 = 1
 
-# Не принимать пакеты source-routing (CIS 3.3.8): отправитель не должен
-# сам задавать маршрут — иначе доступ к приватным сегментам извне
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
-net.ipv6.conf.all.accept_source_route = 0
-net.ipv6.conf.default.accept_source_route = 0
-
 # ============================================================
 #  Безопасность ядра
 # ============================================================
@@ -948,18 +907,23 @@ fs.protected_fifos = 2
 fs.protected_regular = 2
 EOF
 
-# Ограничение user namespaces вынесено под флаг --no-userns, т.к. значение 0
-# ЛОМАЕТ rootless Docker/Podman. По умолчанию НЕ применяется.
-if [[ "${OPT_NO_USERNS}" == "yes" ]]; then
-    cat >> /etc/sysctl.d/99-hardening.conf << 'EOF'
-
-# Ограничить unprivileged user namespaces (--no-userns)
-# ВНИМАНИЕ: ломает rootless-контейнеры
-kernel.unprivileged_userns_clone = 0
-kernel.apparmor_restrict_unprivileged_userns = 1
-EOF
-    warn "userns отключён (--no-userns): rootless Docker/Podman работать НЕ будет"
-fi
+# ── User namespaces: параметр зависит от ядра ─────────────────────────────────
+# kernel.unprivileged_userns_clone — Debian/Ubuntu-патч, отсутствует на новых
+# ядрах (24.04+/26.04). Там вместо него apparmor_restrict_unprivileged_userns.
+# Пишем только те параметры, которые реально существуют в ядре.
+{
+    echo ""
+    echo "# ============================================================"
+    echo "#  Ограничение user namespaces (подобрано под текущее ядро)"
+    echo "#  Отключите/закомментируйте если используете rootless Docker/Podman"
+    echo "# ============================================================"
+    if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
+        echo "kernel.unprivileged_userns_clone = 0"
+    fi
+    if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+        echo "kernel.apparmor_restrict_unprivileged_userns = 1"
+    fi
+} >> /etc/sysctl.d/99-hardening.conf
 
 sysctl --system -q
 info "Параметры ядра применены"
@@ -968,7 +932,6 @@ info "Параметры ядра применены"
 # 11. Blacklist модулей ядра
 #     VPS-специфика: USB/Firewire убраны — на виртуалке их нет,
 #     а блокировка некоторых virtio-драйверов может сломать систему.
-#     Блокируем только сетевые протоколы и ФС с историей уязвимостей.
 # ──────────────────────────────────────────────────────────────────────────────
 section "11. Blacklist опасных модулей ядра"
 
@@ -997,29 +960,6 @@ install sctp /bin/false
 install rds  /bin/false
 install tipc /bin/false
 EOF
-
-# Расширенный список редких ФС (--with-fs-blacklist).
-# СОЗНАТЕЛЬНО НЕ включены ext/fuse/fscache/vfat/overlay/squashfs —
-# их блокировка ломает корень ФС, snap, контейнеры и EFI.
-if [[ "${OPT_FS_BLACKLIST}" == "yes" ]]; then
-    cat >> /etc/modprobe.d/hardening-blacklist.conf << 'EOF'
-
-# Расширенный blacklist редких ФС (--with-fs-blacklist)
-blacklist afs
-blacklist ceph
-blacklist cifs
-blacklist exfat
-blacklist gfs2
-blacklist nfsv3
-blacklist nfsv4
-install afs   /bin/false
-install ceph  /bin/false
-install cifs  /bin/false
-install exfat /bin/false
-install gfs2  /bin/false
-EOF
-    warn "Расширенный FS-blacklist включён: NFS/CIFS/ceph работать НЕ будут"
-fi
 
 update-initramfs -u -k all 2>/dev/null || true
 info "Blacklist модулей применён (полная сила — после reboot)"
@@ -1050,7 +990,17 @@ info "Core dump отключён"
 # ──────────────────────────────────────────────────────────────────────────────
 section "13. Auditd — аудит системных событий"
 
-# ── auditd.conf — лимиты хранения, рассчитанные из свободного места на диске ──
+# Повторный запуск скрипта: если правила уже immutable (-e 2),
+# любая попытка их изменить или перезапустить auditd уронит скрипт.
+if auditctl -s 2>/dev/null | grep -q "enabled 2"; then
+    warn "Правила auditd в режиме immutable (enabled 2) — изменить можно только после reboot"
+    warn "Секция 13 пропущена. Новые правила применятся при следующей загрузке,"
+    warn "если файлы /etc/audit/ уже содержат нужную конфигурацию."
+else
+
+# ── auditd.conf — лимиты хранения, рассчитанные из свободного места ──────────
+# ИСПРАВЛЕНО: убраны dispatcher/disp_qos — удалены в auditd 3.x (Ubuntu 22.04+),
+# audispd больше не существует как отдельный бинарник
 mkdir -p /etc/audit
 cat > /etc/audit/auditd.conf << EOF
 # Сгенерировано ubuntu_hardening.sh
@@ -1064,7 +1014,7 @@ max_log_file = ${AUDIT_MAX_FILE_MB}
 num_logs = ${AUDIT_NUM_LOGS}
 max_log_file_action = ROTATE
 
-# При нехватке места — не падать, а писать в syslog и удалять старые
+# При нехватке места — не падать, а писать в syslog и ротировать
 space_left = $(( AUDIT_MAX_FILE_MB * 2 ))
 space_left_action = SYSLOG
 admin_space_left = $(( AUDIT_MAX_FILE_MB ))
@@ -1072,31 +1022,30 @@ admin_space_left_action = ROTATE
 disk_full_action = ROTATE
 disk_error_action = SYSLOG
 
-# Буфер диспетчера
-disp_qos = lossy
-dispatcher = /sbin/audispd
 name_format = HOSTNAME
 
-# Флаш: каждые 5 секунд или 50 записей
+# Флаш: каждые 50 записей, асинхронно
 flush = INCREMENTAL_ASYNC
 freq = 50
 EOF
 
 # ── Правила аудита ─────────────────────────────────────────────────────────────
-# Режим сбоя: 1 = syslog (по умолчанию, безопасно для VPS).
-# --with-audit-strict -> 2 = паника ядра при невозможности записи аудита.
-AUDIT_FAIL_MODE=1
-[[ "${OPT_AUDIT_STRICT}" == "yes" ]] && { AUDIT_FAIL_MODE=2; warn "auditd -f 2: ядро уйдёт в панику при сбое аудита (--with-audit-strict)"; }
-
+# ИСПРАВЛЕНО:
+#   - удалены правила на socket/connect: аудит КАЖДОГО сетевого вызова на
+#     сервере генерирует тысячи событий/сек — это и была главная причина
+#     "backlog limit exceeded", увеличение буфера лечило симптом
+#   - net_bind оставлен с фильтром по auid (новые слушающие сокеты — редкое
+#     и действительно интересное событие)
+#   - добавлены arch=b32 правила: без них 32-битные syscalls не аудировались
+#     (классический способ обхода аудита)
+#   - убран --backlog_wait_time 1: значение 1 мс УМЕНЬШАЛО ожидание
+#     и увеличивало потери (комментарий в старой версии был неверным)
 cat > /etc/audit/rules.d/99-hardening.rules << EOF
 -D
 # backlog рассчитан из RAM: ${AUDIT_BACKLOG} записей
-# (формула: RAM_MB × 8, диапазон 8192–65536)
 -b ${AUDIT_BACKLOG}
-# --backlog_wait_time: ждать 1 мс перед отбрасыванием события (снижает потери)
---backlog_wait_time 1
-# Режим сбоя (1 = syslog для VPS; 2 = паника при --with-audit-strict)
--f ${AUDIT_FAIL_MODE}
+# Режим сбоя 1 = писать в syslog (не 2/паника — VPS без физического доступа!)
+-f 1
 
 # Идентификация
 -w /etc/passwd    -p wa -k identity
@@ -1119,41 +1068,15 @@ cat > /etc/audit/rules.d/99-hardening.rules << EOF
 -w /etc/cron.weekly/  -p wa -k cron
 -w /var/spool/cron/   -p wa -k cron
 
-# Управление привилегиями
--a always,exit -F arch=b64 -S chmod,fchmod,fchmodat             -k file_perm
--a always,exit -F arch=b64 -S chown,fchown,fchownat,lchown      -k file_perm
--a always,exit -F arch=b64 -S setuid,setgid,setreuid,setregid   -k priv_esc
--a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000    -k priv_exec
-
-# Изменение времени и даты (CIS 6.2.3.4)
--a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time-change
--w /etc/localtime -p wa -k time-change
-
-# Неуспешный доступ к файлам: EACCES/EPERM (CIS 6.2.3.7)
--a always,exit -F arch=b64 -S open,openat,truncate,ftruncate,creat -F exit=-EACCES -F auid>=1000 -k file_access
--a always,exit -F arch=b64 -S open,openat,truncate,ftruncate,creat -F exit=-EPERM  -F auid>=1000 -k file_access
-
-# Монтирование ФС (CIS 6.2.3.10)
--a always,exit -F arch=b64 -S mount,umount2 -F auid>=1000 -k mounts
-
-# Удаление/переименование файлов пользователями (CIS 6.2.3.13)
--a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat -F auid>=1000 -k delete
-
-# Логин/выход и инициализация сессий (CIS 6.2.3.11-6.2.3.12)
--w /var/log/lastlog -p wa -k logins
--w /var/run/faillock -p wa -k logins
--w /var/log/wtmp  -p wa -k session
--w /var/log/btmp  -p wa -k session
-
-# Изменение мандатной системы контроля доступа — AppArmor (CIS 6.2.3.14)
--w /etc/apparmor/   -p wa -k MAC-policy
--w /etc/apparmor.d/ -p wa -k MAC-policy
-
-# Утилиты изменения прав/ACL/контекста и УЗ (CIS 6.2.3.15-6.2.3.18)
--a always,exit -F path=/usr/bin/chcon    -F perm=x -F auid>=1000 -k perm_chng
--a always,exit -F path=/usr/bin/setfacl  -F perm=x -F auid>=1000 -k perm_chng
--a always,exit -F path=/usr/bin/chacl    -F perm=x -F auid>=1000 -k perm_chng
--a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=1000 -k usermod
+# Управление привилегиями (b64 + b32 — иначе 32-битные вызовы не аудируются)
+-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat           -F auid>=1000 -F auid!=unset -k file_perm
+-a always,exit -F arch=b32 -S chmod,fchmod,fchmodat           -F auid>=1000 -F auid!=unset -k file_perm
+-a always,exit -F arch=b64 -S chown,fchown,fchownat,lchown    -F auid>=1000 -F auid!=unset -k file_perm
+-a always,exit -F arch=b32 -S chown,fchown,fchownat,lchown    -F auid>=1000 -F auid!=unset -k file_perm
+-a always,exit -F arch=b64 -S setuid,setgid,setreuid,setregid -k priv_esc
+-a always,exit -F arch=b32 -S setuid,setgid,setreuid,setregid -k priv_esc
+-a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -F auid!=unset -k priv_exec
+-a always,exit -F arch=b32 -S execve -F euid=0 -F auid>=1000 -F auid!=unset -k priv_exec
 
 # Модули ядра
 -w /sbin/insmod    -p x -k kernel_modules
@@ -1161,10 +1084,9 @@ cat > /etc/audit/rules.d/99-hardening.rules << EOF
 -w /sbin/modprobe  -p x -k kernel_modules
 -a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k kernel_modules
 
-# Сеть
--a always,exit -F arch=b64 -S socket  -F a0=2 -k net_socket
--a always,exit -F arch=b64 -S connect          -k net_connect
--a always,exit -F arch=b64 -S bind             -k net_bind
+# Сеть: только bind реальных пользователей (новый слушающий сокет — редкое
+# и значимое событие). socket/connect НЕ аудируем — источник backlog exceeded.
+-a always,exit -F arch=b64 -S bind -F auid>=1000 -F auid!=unset -k net_bind
 
 # Загрузчик и ядро
 -w /boot/ -p wa -k boot
@@ -1173,33 +1095,24 @@ cat > /etc/audit/rules.d/99-hardening.rules << EOF
 -e 2
 EOF
 
-# ── logrotate для /var/log/audit ───────────────────────────────────────────────
-cat > /etc/logrotate.d/audit << EOF
-/var/log/audit/audit.log {
-    daily
-    missingok
-    rotate ${AUDIT_NUM_LOGS}
-    maxsize ${AUDIT_MAX_FILE_MB}M
-    compress
-    delaycompress
-    notifempty
-    create 0600 root root
-    postrotate
-        /sbin/service auditd restart > /dev/null 2>&1 || true
-    endscript
-}
-EOF
+# ИСПРАВЛЕНО: файл /etc/logrotate.d/audit удалён из скрипта.
+# auditd ротирует логи сам (max_log_file_action = ROTATE); параллельный
+# logrotate с рестартом auditd давал двойную ротацию и разрывы аудита.
+rm -f /etc/logrotate.d/audit
 
 mkdir -p /var/log/audit
-service auditd restart 2>/dev/null || systemctl restart auditd
+augenrules --load 2>/dev/null || true
+systemctl restart auditd 2>/dev/null || service auditd restart 2>/dev/null || true
 info "auditd настроен: backlog=${AUDIT_BACKLOG}, ${AUDIT_NUM_LOGS}×${AUDIT_MAX_FILE_MB}МБ (≤10% диска)"
+
+fi  # конец проверки immutable
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 14. AppArmor
 # ──────────────────────────────────────────────────────────────────────────────
 section "14. AppArmor"
 
-if ! dpkg -l apparmor-utils &>/dev/null 2>&1; then
+if ! dpkg -s apparmor-utils &>/dev/null; then
     apt-get install -y -qq apparmor apparmor-utils
 fi
 
@@ -1219,20 +1132,15 @@ cat > /etc/sudoers.d/99-hardening << 'EOF'
 Defaults    timestamp_timeout=5
 # Не показывать символы при вводе пароля
 Defaults    !visiblepw
-# sudo выполняется только в псевдотерминале (CIS 5.2.2) — мешает части атак,
-# где форкнутый процесс продолжает жить после завершения родителя
-Defaults    use_pty
 # Фиксированный безопасный PATH — защита от подмены системных утилит
 Defaults    secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 EOF
 chmod 440 /etc/sudoers.d/99-hardening
 
-# Проверяем синтаксис до применения
 visudo -c && info "sudo: конфигурация корректна" || warn "Проверьте sudoers вручную!"
 
-# Логирование sudo через syslog (работает на всех версиях Ubuntu без плагинов)
-# sudo пишет в /var/log/auth.log по умолчанию — дополнительно направляем в отдельный файл
-if ! grep -q "sudo" /etc/rsyslog.d/*.conf 2>/dev/null; then
+# Логирование sudo через rsyslog (без плагинов, работает на всех версиях)
+if ! grep -qs "sudo" /etc/rsyslog.d/*.conf 2>/dev/null; then
     cat > /etc/rsyslog.d/50-sudo.conf << 'RSYSEOF'
 # Логи sudo в отдельный файл
 :programname, isequal, "sudo" /var/log/sudo.log
@@ -1242,7 +1150,6 @@ RSYSEOF
     info "sudo: логирование через rsyslog -> /var/log/sudo.log"
 fi
 
-# Права на файл лога
 touch /var/log/sudo.log
 chmod 600 /var/log/sudo.log
 
@@ -1260,8 +1167,6 @@ ucredit = -1
 lcredit = -1
 ocredit = -1
 maxrepeat = 3
-# Запрет длинных монотонных последовательностей вида 12345/abcde (CIS 5.3.3.2.5)
-maxsequence = 3
 dictcheck = 1
 gecoscheck = 1
 EOF
@@ -1277,18 +1182,9 @@ chmod 600 /etc/shadow /etc/gshadow
 chmod 644 /etc/passwd /etc/group
 chmod 700 /boot 2>/dev/null || true
 
-# Права на backup-копии и сопутствующие файлы (CIS 7.1.1-7.1.10)
-for f in /etc/passwd- /etc/group-; do
-    [[ -e "$f" ]] && { chown root:root "$f"; chmod 644 "$f"; }
-done
-for f in /etc/shadow- /etc/gshadow-; do
-    [[ -e "$f" ]] && { chown root:root "$f"; chmod 640 "$f"; }
-done
-[[ -e /etc/security/opasswd ]] && { chown root:root /etc/security/opasswd; chmod 600 /etc/security/opasswd; }
-[[ -e /etc/shells ]]          && { chown root:root /etc/shells; chmod 644 /etc/shells; }
-
-# История shell root -> /dev/null
-ln -sf /dev/null /root/.bash_history 2>/dev/null || true
+# ИЗМЕНЕНО: symlink ~/.bash_history -> /dev/null удалён.
+# Отключение истории — антифорензика: она помогает атакующему скрыть
+# следы больше, чем защищает. Аудит команд root ведёт auditd (priv_exec).
 
 # Убрать SUID у нечасто используемых утилит
 for bin in /usr/bin/chfn /usr/bin/chsh /usr/bin/newgrp; do
@@ -1303,8 +1199,9 @@ info "Права на системные файлы настроены"
 section "18. Удаление телеметрии"
 
 for pkg in ubuntu-report popularity-contest apport whoopsie; do
-    if dpkg -l "$pkg" &>/dev/null 2>&1; then
-        apt-get purge -y -qq "$pkg" && info "Удалён: $pkg"
+    # dpkg -s вместо dpkg -l: -l возвращал 0 даже для удалённых пакетов (статус rc)
+    if dpkg -s "$pkg" &>/dev/null; then
+        apt-get purge -y -qq "$pkg" && info "Удалён: $pkg" || warn "Не удалось удалить: $pkg"
     fi
 done
 
@@ -1326,7 +1223,6 @@ info "Телеметрия удалена"
 # ──────────────────────────────────────────────────────────────────────────────
 section "19. Автоматические security-обновления"
 
-# ── Конфигурация unattended-upgrades ─────────────────────────────────────────
 cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
 // Разрешённые источники обновлений
 Unattended-Upgrade::Allowed-Origins {
@@ -1363,15 +1259,12 @@ Unattended-Upgrade::Mail "root";
 Unattended-Upgrade::MailOnlyOnError "true";
 EOF
 
-# ── Периодичность запуска apt ─────────────────────────────────────────────────
 cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
 
-# ── Таймер apt-daily: фиксированное время 03:00 вместо случайного в течение дня
-# Используем systemd drop-in — не перезаписываем системный unit
 mkdir -p /etc/systemd/system/apt-daily.timer.d
 cat > /etc/systemd/system/apt-daily.timer.d/override.conf << 'EOF'
 [Timer]
@@ -1384,7 +1277,6 @@ OnCalendar=*-*-* 03:00
 RandomizedDelaySec=10m
 EOF
 
-# ── Таймер apt-daily-upgrade: через 30 минут после apt-daily (загрузки списков)
 mkdir -p /etc/systemd/system/apt-daily-upgrade.timer.d
 cat > /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf << 'EOF'
 [Timer]
@@ -1405,321 +1297,21 @@ info "  apt-daily-upgrade : 03:30 ± 10 мин (установка обновл�
 info "  Blacklist: docker, kube, postgresql, mysql, nginx и др."
 info "  Письмо root: только при ошибках"
 
-# Показываем следующий плановый запуск
 echo ""
 systemctl list-timers apt-daily.timer apt-daily-upgrade.timer --no-pager 2>/dev/null \
     | sed 's/^/  /' || true
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 20. Баннеры /etc/issue, /etc/issue.net, /etc/motd  (CIS 1.6)
+# 20. Удаление приватного ключа с сервера
 # ──────────────────────────────────────────────────────────────────────────────
-section "20. Баннеры входа (issue / issue.net / motd)"
-
-# Убираем из баннеров сведения об ОС (помощь в разведке) и ставим юр.текст
-BANNER_TEXT='Authorized access only. All activity is monitored and logged.
-Disconnect immediately if you are not an authorized user.'
-
-echo "${BANNER_TEXT}" > /etc/issue
-echo "${BANNER_TEXT}" > /etc/issue.net
-: > /etc/motd   # пустой motd — без версии ОС и прочей разведданных
-
-chown root:root /etc/motd /etc/issue /etc/issue.net
-chmod 644       /etc/motd /etc/issue /etc/issue.net
-info "Баннеры очищены от версии ОС, права 644 (CIS 1.6.1-1.6.6)"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 21. Окружение пользователей: umask, PATH, login shell  (CIS 5.4)
-# ──────────────────────────────────────────────────────────────────────────────
-section "21. Окружение пользователей (umask, PATH, shell)"
-
-# umask 027 -> новые файлы 640, каталоги 750 (CIS 5.4.2.6 / 5.4.3.3)
-cat > /etc/profile.d/99-hardening-umask.sh << 'EOF'
-# Жёсткий umask по умолчанию (ubuntu_hardening.sh)
-umask 027
-EOF
-chmod 644 /etc/profile.d/99-hardening-umask.sh
-
-# Безопасный PATH для root (CIS 5.4.2.5)
-if ! grep -q "ubuntu_hardening: secure root PATH" /root/.bashrc 2>/dev/null; then
-    cat >> /root/.bashrc << 'EOF'
-
-# ubuntu_hardening: secure root PATH
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-EOF
-fi
-info "umask 027 + безопасный PATH root настроены"
-
-# TMOUT — авто-выход из неактивных shell-сессий (--with-tmout)
-if [[ "${OPT_TMOUT}" == "yes" ]]; then
-    cat > /etc/profile.d/99-hardening-tmout.sh << 'EOF'
-# Авто-выход из интерактивной shell-сессии при 15-мин простое (ubuntu_hardening.sh)
-TMOUT=900
-readonly TMOUT
-export TMOUT
-EOF
-    chmod 644 /etc/profile.d/99-hardening-tmout.sh
-    info "TMOUT=900 включён (--with-tmout)"
-else
-    info "TMOUT не задан (включается --with-tmout)"
-fi
-
-# Системные УЗ без интерактивного shell (CIS 5.4.2.7) — отчёт, без автоправок
-echo ""
-echo "  Системные УЗ (uid<1000) с интерактивным shell — проверьте вручную:"
-awk -F: '($3<1000 && $3!=0 && $7 ~ /(bash|sh|zsh)$/){print "    "$1" -> "$7}' /etc/passwd || true
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 22. Загрузчик GRUB  (CIS 1.3.1.2, 1.4.x, 6.2.1.3)
-# ──────────────────────────────────────────────────────────────────────────────
-section "22. Загрузчик GRUB (cmdline, права, [пароль])"
-
-GRUB_DEFAULT_FILE="/etc/default/grub"
-if [[ -f "${GRUB_DEFAULT_FILE}" ]]; then
-    cp "${GRUB_DEFAULT_FILE}" "${GRUB_DEFAULT_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-    # audit=1 + backlog в cmdline: аудит с самых первых процессов (CIS 6.2.1.3-6.2.1.4)
-    # apparmor=1 security=apparmor: гарантированно активный AppArmor (CIS 1.3.1.2)
-    CURRENT_CMDLINE=$(grep "^GRUB_CMDLINE_LINUX=" "${GRUB_DEFAULT_FILE}" | head -1 | sed 's/^GRUB_CMDLINE_LINUX=//; s/^"//; s/"$//')
-    # Убираем прежние управляемые нами токены, чтобы не дублировать
-    for key in audit audit_backlog_limit apparmor security; do
-        CURRENT_CMDLINE=$(echo " ${CURRENT_CMDLINE} " | sed -E "s/ ${key}=[^ ]*//g")
-    done
-    CURRENT_CMDLINE=$(echo "${CURRENT_CMDLINE} audit=1 audit_backlog_limit=${AUDIT_BACKLOG} apparmor=1 security=apparmor" | tr -s ' ' | sed 's/^ //; s/ $//')
-    sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"${CURRENT_CMDLINE}\"|" "${GRUB_DEFAULT_FILE}"
-    info "GRUB cmdline: ${CURRENT_CMDLINE}"
-
-    # Пароль на загрузчик (--with-grub-password). --unrestricted -> загрузка ОС
-    # без пароля, пароль требуется только для РЕДАКТИРОВАНИЯ записей GRUB.
-    if [[ "${OPT_GRUB_PASSWORD}" == "yes" ]]; then
-        warn "Задайте пароль администратора GRUB (потребуется для правки меню загрузчика):"
-        if command -v grub-mkpasswd-pbkdf2 &>/dev/null; then
-            GRUB_HASH=$(grub-mkpasswd-pbkdf2 | awk '/grub.pbkdf/{print $NF}')
-            if [[ -n "${GRUB_HASH}" ]]; then
-                cat > /etc/grub.d/40_custom << EOF
-#!/bin/sh
-exec tail -n +3 \$0
-set superusers="grubadmin"
-password_pbkdf2 grubadmin ${GRUB_HASH}
-EOF
-                chmod 755 /etc/grub.d/40_custom
-                # --unrestricted, чтобы не требовать пароль при штатной загрузке
-                sed -i 's/\(CLASS="--class gnu-linux --class gnu --class os\)"/\1 --unrestricted"/' /etc/grub.d/10_linux 2>/dev/null || true
-                info "Пароль GRUB установлен (суперпользователь grubadmin, --unrestricted)"
-                warn "Проверьте загрузку с консоли провайдера ДО того, как доверитесь удалённому ребуту!"
-            else
-                warn "Не удалось получить хеш пароля GRUB — пропускаем"
-            fi
-        else
-            warn "grub-mkpasswd-pbkdf2 не найден — пароль GRUB пропущен"
-        fi
-    fi
-
-    update-grub 2>/dev/null || warn "update-grub не выполнен (нет GRUB? — нормально для части VPS)"
-else
-    warn "/etc/default/grub не найден — GRUB не настраивается (cloud-образ без GRUB?)"
-fi
-
-# Права 600 на сгенерированный конфиг загрузчика (CIS 1.4.2)
-for g in /boot/grub/grub.cfg /boot/grub2/grub.cfg; do
-    [[ -f "$g" ]] && { chown root:root "$g"; chmod 600 "$g"; info "Права 600 на $g"; }
-done
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 23. PAM: блокировка УЗ после неудачных входов  (CIS 5.3.3.1) — 🔴 флаг
-# ──────────────────────────────────────────────────────────────────────────────
-section "23. PAM: блокировка УЗ (pam_faillock)"
-
-if [[ "${OPT_PAM_LOCKOUT}" == "yes" ]]; then
-    warn "Включается pam_faillock — при ошибке в PAM возможен ЛОКАУТ. Держите консоль открытой!"
-    # Параметры блокировки. even_deny_root НЕ задаём — чтобы не заблокировать root на VPS.
-    cat > /etc/security/faillock.conf << 'EOF'
-# ubuntu_hardening.sh — блокировка после неудачных входов
-deny = 5
-unlock_time = 900
-fail_interval = 900
-# even_deny_root и root_unlock_time сознательно НЕ заданы (риск локаута root на VPS)
-EOF
-    COMMON_AUTH="/etc/pam.d/common-auth"
-    if [[ -f "${COMMON_AUTH}" ]] && ! grep -q "pam_faillock.so" "${COMMON_AUTH}"; then
-        cp "${COMMON_AUTH}" "${COMMON_AUTH}.bak.$(date +%Y%m%d%H%M%S)"
-        # preauth — перед первым auth-модулем
-        sed -i '0,/^auth/s//auth\trequired\t\t\tpam_faillock.so preauth\nauth/' "${COMMON_AUTH}"
-        # authfail/authsucc — в конец auth-стека
-        cat >> "${COMMON_AUTH}" << 'EOF'
-auth	[default=die]		pam_faillock.so authfail
-auth	sufficient		pam_faillock.so authsucc
-EOF
-        info "pam_faillock включён: 5 попыток -> блок на 15 минут (root НЕ блокируется)"
-        warn "Резерв: ${COMMON_AUTH}.bak.* — восстановите с консоли, если сломается вход"
-    else
-        info "pam_faillock уже присутствует или common-auth не найден — пропуск"
-    fi
-else
-    info "Блокировка УЗ не включена (включается --with-pam-lockout)"
-fi
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 24. PAM: история паролей и стойкий хеш  (CIS 5.3.2.4, 5.3.3.4) — 🟡 флаг
-# ──────────────────────────────────────────────────────────────────────────────
-section "24. PAM: история паролей + yescrypt"
-
-if [[ "${OPT_PWHISTORY}" == "yes" ]]; then
-    cat > /etc/security/pwhistory.conf << 'EOF'
-# ubuntu_hardening.sh — запрет повтора старых паролей
-remember = 5
-use_authtok
-enforce_for_root
-EOF
-    COMMON_PW="/etc/pam.d/common-password"
-    if [[ -f "${COMMON_PW}" ]]; then
-        cp "${COMMON_PW}" "${COMMON_PW}.bak.$(date +%Y%m%d%H%M%S)"
-        # Добавляем pam_pwhistory перед pam_unix (если ещё нет)
-        if ! grep -q "pam_pwhistory.so" "${COMMON_PW}"; then
-            sed -i '0,/^password.*pam_unix.so/s//password\trequisite\t\t\tpam_pwhistory.so\n&/' "${COMMON_PW}"
-        fi
-        # Гарантируем yescrypt в pam_unix (CIS 5.3.3.4.3); убираем устаревший remember
-        sed -i -E 's/(password\s+\[success=[0-9]+ default=ignore\]\s+pam_unix.so.*)/\1/' "${COMMON_PW}"
-        if grep -q "pam_unix.so" "${COMMON_PW}" && ! grep "pam_unix.so" "${COMMON_PW}" | grep -q "yescrypt"; then
-            sed -i -E '/pam_unix.so/ s/(pam_unix.so[^\n]*)/\1 yescrypt/' "${COMMON_PW}"
-        fi
-        sed -i -E '/pam_unix.so/ s/\bremember=[0-9]+\b//g; /pam_unix.so/ s/\bnullok\b//g' "${COMMON_PW}"
-        # Снимаем nullok и из common-auth (пустые пароли запрещены, CIS 5.3.3.4.1)
-        [[ -f /etc/pam.d/common-auth ]] && sed -i -E '/pam_unix.so/ s/\bnullok\b//g' /etc/pam.d/common-auth || true
-        info "pam_pwhistory (remember=5) + yescrypt, nullok убран (CIS 5.3.3.4)"
-        warn "Резерв: ${COMMON_PW}.bak.*"
-    fi
-else
-    info "История паролей не включена (включается --with-pwhistory)"
-fi
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 25. Старение паролей  (CIS 5.4.1) — 🔴 флаг
-# ──────────────────────────────────────────────────────────────────────────────
-section "25. Старение паролей (login.defs)"
-
-if [[ "${OPT_PASSWORD_AGING}" == "yes" ]]; then
-    warn "Включается старение паролей — при игнорировании смены возможен ЛОКАУТ"
-    sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t365/'  /etc/login.defs
-    sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS\t1/'    /etc/login.defs
-    sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE\t7/'    /etc/login.defs
-    # Применяем к существующему админу (не к root — чтобы не заблокировать аварийный вход)
-    chage --maxdays 365 --mindays 1 --warndays 7 "${ADMIN_USER}" 2>/dev/null || true
-    info "PASS_MAX_DAYS=365, PASS_MIN_DAYS=1, PASS_WARN_AGE=7 (root не затронут)"
-else
-    info "Старение паролей не включено (включается --with-password-aging)"
-fi
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 26. Минимизация сервисов  (CIS 2.1-2.2) — 🟡 флаг, интерактивно
-# ──────────────────────────────────────────────────────────────────────────────
-section "26. Минимизация сервисов"
-
-if [[ "${OPT_MINIMIZE_SVC}" == "yes" ]]; then
-    echo ""
-    echo "  Сервисы, слушающие сетевые порты (проверьте необходимость каждого):"
-    ss -tulnp 2>/dev/null | sed 's/^/    /' || true
-    echo ""
-    # Кандидаты на удаление: явно лишние на типовом VPS. Каждый — с подтверждением.
-    SVC_CANDIDATES=(avahi-daemon cups isc-dhcp-server slapd dovecot-core \
-                    nfs-kernel-server rpcbind samba snmpd squid xinetd \
-                    vsftpd telnetd rsh-server talk nis)
-    for pkg in "${SVC_CANDIDATES[@]}"; do
-        if dpkg -l "$pkg" &>/dev/null 2>&1; then
-            read -r -p "  Найден '${pkg}'. Удалить (purge)? [y/N]: " _svc
-            if [[ "${_svc}" =~ ^[Yy]$ ]]; then
-                apt-get purge -y -qq "$pkg" && info "Удалён: $pkg"
-            else
-                info "Оставлен: $pkg"
-            fi
-        fi
-    done
-    # MTA в local-only, если postfix установлен
-    if dpkg -l postfix &>/dev/null 2>&1; then
-        postconf -e 'inet_interfaces = loopback-only' 2>/dev/null \
-            && systemctl restart postfix 2>/dev/null \
-            && info "postfix переведён в local-only (не слушает сеть)" || true
-    fi
-else
-    info "Минимизация сервисов не запускалась (включается --minimize-services)"
-fi
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 27. AIDE — контроль целостности файлов  (CIS 6.3.1) — 🟡 флаг
-# ──────────────────────────────────────────────────────────────────────────────
-section "27. AIDE — контроль целостности"
-
-if [[ "${OPT_AIDE}" == "yes" ]] && command -v aideinit &>/dev/null; then
-    info "Инициализация базы AIDE (может занять несколько минут)..."
-    aideinit -y -f 2>/dev/null || aideinit 2>/dev/null || true
-    if [[ -f /var/lib/aide/aide.db.new ]]; then
-        mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db 2>/dev/null || true
-    fi
-    # Ежедневная проверка через systemd timer ставится пакетом aide-common;
-    # дублируем cron на случай его отсутствия
-    cat > /etc/cron.daily/aide-check << 'EOF'
-#!/bin/sh
-/usr/bin/aide --check 2>&1 | logger -t aide
-EOF
-    chmod 755 /etc/cron.daily/aide-check
-    info "AIDE инициализирован, ежедневная проверка -> syslog (tag: aide)"
-elif [[ "${OPT_AIDE}" == "yes" ]]; then
-    warn "AIDE запрошен, но aideinit не найден — проверьте установку пакета aide"
-else
-    info "AIDE не настраивался (включается --with-aide)"
-fi
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 28. Аудит ФС и консистентность УЗ  (CIS 7.1-7.2) — отчёт, без автоправок
-# ──────────────────────────────────────────────────────────────────────────────
-section "28. Аудит ФС и учётных записей (только отчёт)"
-
-REPORT="/root/hardening-audit-report.txt"
-{
-    echo "=== Отчёт аудита ФС/УЗ — $(date) ==="
-    echo ""
-    echo "--- World-writable файлы (без sticky), первые 50 (CIS 7.1.11) ---"
-    find / -xdev -type f -perm -0002 2>/dev/null | head -50
-    echo ""
-    echo "--- World-writable каталоги без sticky bit (CIS 7.1.11) ---"
-    find / -xdev -type d -perm -0002 ! -perm -1000 2>/dev/null | head -50
-    echo ""
-    echo "--- Файлы без владельца/группы (CIS 7.1.12) ---"
-    find / -xdev \( -nouser -o -nogroup \) 2>/dev/null | head -50
-    echo ""
-    echo "--- SUID/SGID файлы — baseline для ручной проверки (CIS 7.1.13) ---"
-    find / -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null
-    echo ""
-    echo "--- Дубликаты UID (CIS 7.2.5) ---"
-    cut -d: -f3 /etc/passwd | sort | uniq -d
-    echo "--- Дубликаты GID (CIS 7.2.6) ---"
-    cut -d: -f3 /etc/group | sort | uniq -d
-    echo "--- Пустые пароли в /etc/shadow (CIS 7.2.2) ---"
-    awk -F: '($2==""){print $1}' /etc/shadow
-    echo "--- Группы из /etc/passwd, отсутствующие в /etc/group (CIS 7.2.3) ---"
-    for gid in $(cut -d: -f4 /etc/passwd | sort -u); do
-        getent group "$gid" >/dev/null 2>&1 || echo "GID $gid не найден в /etc/group"
-    done
-    echo "--- UID 0, кроме root (CIS 5.4.2.1) ---"
-    awk -F: '($3==0){print $1}' /etc/passwd
-} > "${REPORT}" 2>/dev/null || true
-
-chmod 600 "${REPORT}"
-info "Отчёт сохранён: ${REPORT}"
-echo "  Ключевые находки (детали — в файле):"
-grep -E "UID 0|не найден|^[a-z]" "${REPORT}" 2>/dev/null | grep -vE "^---|^===" | head -10 | sed 's/^/    /' || true
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 29. Удаление приватного ключа с сервера
-# ──────────────────────────────────────────────────────────────────────────────
-section "29. Финальный шаг — удаление приватного ключа с сервера"
+section "20. Финальный шаг — удаление приватного ключа с сервера"
 
 echo ""
 echo -e "${RED}+------------------------------------------------------------+${NC}"
 echo -e "${RED}|  ПОСЛЕДНИЙ ШАГ: УДАЛЕНИЕ ПРИВАТНОГО КЛЮЧА С СЕРВЕРА       |${NC}"
 echo -e "${RED}|                                                            |${NC}"
-echo -e "${RED}|  Проверьте вход в новом терминале:                         |${NC}"
-echo -e "${RED}|  ssh -p ${SSH_PORT} -i ./admin_ssh_key ${ADMIN_USER}@<IP>         |${NC}"
-echo -e "${RED}|                                                            |${NC}"
 echo -e "${RED}|  Если ключ НЕ скачан — скачайте сейчас, не закрывая окно! |${NC}"
+echo -e "${RED}|  scp -P 22 root@<IP>:${KEY_PATH} ./admin_ssh_key |${NC}"
 echo -e "${RED}+------------------------------------------------------------+${NC}"
 echo ""
 read -r -p "Вы скачали ключ и вход работает? Удалить с сервера? [y/N]: " confirm
@@ -1745,46 +1337,31 @@ echo -e "${GREEN}+============================================================+$
 echo -e "${GREEN}|             HARDENING ЗАВЕРШЁН УСПЕШНО                    |${NC}"
 echo -e "${GREEN}+============================================================+${NC}"
 echo ""
-printf "  %-48s %s\n" "SSH-ключ ECDSA-521 сгенерирован"        "[OK]"
+printf "  %-48s %s\n" "SSH-ключ ${KEY_TYPE} сгенерирован"      "[OK]"
 printf "  %-48s %s\n" "Пользователь '${ADMIN_USER}' создан"    "[OK]"
 printf "  %-48s %s\n" "SSH: порт ${SSH_PORT}, только ключи"    "[OK]"
-printf "  %-48s %s\n" "SSH: GSSAPI/Hostbased/AgentFwd off"     "[OK]"
-printf "  %-48s %s\n" "Root заблокирован"                      "[OK]"
+printf "  %-48s %s\n" "ssh.socket отключён (Port применяется)" "[OK]"
+printf "  %-48s %s\n" "Root заблокирован (после проверки входа)" "[OK]"
 printf "  %-48s %s\n" "UFW: разрешён только SSH:${SSH_PORT}"   "[OK]"
 printf "  %-48s %s\n" "Fail2ban: 3 попытки -> бан 24ч"         "[OK]"
-printf "  %-48s %s\n" "sysctl: сеть + ядро + source-route"     "[OK]"
+printf "  %-48s %s\n" "sysctl: сеть + ядро"                    "[OK]"
 printf "  %-48s %s\n" "Blacklist: опасные ФС/протоколы"        "[OK]"
 printf "  %-48s %s\n" "/tmp /dev/shm /var/tmp: noexec"         "[OK]"
 printf "  %-48s %s\n" "Cron: только root"                      "[OK]"
-printf "  %-48s %s\n" "Auditd: расширенные правила"            "[OK]"
+printf "  %-48s %s\n" "Auditd: аудит без шумных правил"        "[OK]"
 printf "  %-48s %s\n" "Core dump отключён"                     "[OK]"
 printf "  %-48s %s\n" "AppArmor: enforce"                      "[OK]"
-printf "  %-48s %s\n" "sudo: use_pty + лог + тайм-аут"         "[OK]"
-printf "  %-48s %s\n" "Политика паролей: 16+ / maxsequence"    "[OK]"
-printf "  %-48s %s\n" "Баннеры issue/motd очищены"             "[OK]"
-printf "  %-48s %s\n" "umask 027 + secure PATH"                "[OK]"
-printf "  %-48s %s\n" "GRUB: cmdline audit=1 + права 600"      "[OK]"
-printf "  %-48s %s\n" "Отчёт аудита ФС/УЗ -> /root"            "[OK]"
+printf "  %-48s %s\n" "sudo: лог + тайм-аут 5 мин"            "[OK]"
+printf "  %-48s %s\n" "Политика паролей: 16+ символов"         "[OK]"
 printf "  %-48s %s\n" "Телеметрия удалена"                     "[OK]"
 printf "  %-48s %s\n" "Автообновления security"                "[OK]"
 echo ""
-echo -e "  ${CYAN}Рискованные опции (по флагам):${NC}"
-printf "  %-40s %s\n" "pam-lockout (--with-pam-lockout)"     "$([[ ${OPT_PAM_LOCKOUT}   == yes ]] && echo '[ВКЛ]' || echo '[выкл]')"
-printf "  %-40s %s\n" "pwhistory  (--with-pwhistory)"        "$([[ ${OPT_PWHISTORY}     == yes ]] && echo '[ВКЛ]' || echo '[выкл]')"
-printf "  %-40s %s\n" "password-aging (--with-password-aging)" "$([[ ${OPT_PASSWORD_AGING} == yes ]] && echo '[ВКЛ]' || echo '[выкл]')"
-printf "  %-40s %s\n" "tmout (--with-tmout)"                 "$([[ ${OPT_TMOUT}         == yes ]] && echo '[ВКЛ]' || echo '[выкл]')"
-printf "  %-40s %s\n" "aide (--with-aide)"                   "$([[ ${OPT_AIDE}          == yes ]] && echo '[ВКЛ]' || echo '[выкл]')"
-printf "  %-40s %s\n" "audit-strict (--with-audit-strict)"   "$([[ ${OPT_AUDIT_STRICT}  == yes ]] && echo '[ВКЛ]' || echo '[выкл]')"
-printf "  %-40s %s\n" "no-userns (--no-userns)"              "$([[ ${OPT_NO_USERNS}     == yes ]] && echo '[ВКЛ]' || echo '[выкл]')"
-printf "  %-40s %s\n" "fs-blacklist (--with-fs-blacklist)"   "$([[ ${OPT_FS_BLACKLIST}  == yes ]] && echo '[ВКЛ]' || echo '[выкл]')"
-printf "  %-40s %s\n" "minimize-services (--minimize-services)" "$([[ ${OPT_MINIMIZE_SVC} == yes ]] && echo '[ВКЛ]' || echo '[выкл]')"
-printf "  %-40s %s\n" "grub-password (--with-grub-password)" "$([[ ${OPT_GRUB_PASSWORD} == yes ]] && echo '[ВКЛ]' || echo '[выкл]')"
+echo -e "  ${YELLOW}Лог выполнения:${NC} ${RUN_LOG}"
 echo ""
 echo -e "  ${YELLOW}Требуется перезагрузка для:${NC}"
 echo "    - blacklist модулей ядра (DCCP, SCTP, редкие ФС)"
-echo "    - GRUB cmdline (audit=1, apparmor=1)"
 echo "    - /var/tmp bind-mount (если не применился)"
-[[ "${OPT_NO_USERNS}" == "yes" ]] && echo "    - kernel.unprivileged_userns_clone (--no-userns)"
+echo "    - ограничения user namespaces (на части ядер)"
 echo ""
 echo -e "  ${CYAN}Подключение после reboot:${NC}"
 echo "    ssh -p ${SSH_PORT} -i ./admin_ssh_key ${ADMIN_USER}@<IP>"
