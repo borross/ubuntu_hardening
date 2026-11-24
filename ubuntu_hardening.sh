@@ -1,81 +1,117 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Ubuntu Hardening Script — VPS/VDS Edition  (v3.1)
+#  Ubuntu Hardening Script — VPS/VDS Edition  (v4.0)
 #  Целевая платформа: Ubuntu 22.04 / 24.04 / 26.04 на виртуальном сервере
 #  Запускать от root сразу после получения сервера
 #
 #  Использование:
 #    bash ubuntu_hardening.sh                      # полный харденинг (интерактивно)
+#    bash ubuntu_hardening.sh --config hard.conf --yes   # без вопросов (cloud-init, Ansible)
+#    bash ubuntu_hardening.sh --only ssh,ufw       # только выбранные шаги
+#    bash ubuntu_hardening.sh --audit              # проверка без изменений
+#    bash ubuntu_hardening.sh --rollback [метка]   # откат файлов прогона
 #    bash ubuntu_hardening.sh --luks <режим> ...   # шифрование LUKS2 (см. --help)
 #    bash ubuntu_hardening.sh --help
 #
-#  Изменения v3 / v3.1:
-#    - приватный ключ выводится только на терминал (/dev/tty) и больше
-#      не попадает в лог выполнения; можно указать свой публичный ключ
-#    - имя администратора спрашивается (по умолчанию admin)
-#    - SSH: постквантовый обмен ключами (mlkem768x25519 / sntrup761x25519),
-#      список KEX строится из того, что поддерживает установленный OpenSSH;
-#      убраны устаревшие Protocol / ChallengeResponseAuthentication;
-#      если UFW уже активен — новый порт открывается ДО перезапуска sshd
-#    - su действительно ограничен группой sudo (старое регулярное выражение
-#      не находило строку "# auth required pam_wheel.so")
-#    - политика паролей (enforce_for_root) применяется ДО задания пароля
-#    - sudoers проверяется visudo -cf до установки (root уже заблокирован —
-#      битый sudoers означал бы потерю доступа)
-#    - /home без отдельного раздела: bind-монтирование через fstab вместо
-#      remount-home.service, который падал при каждой загрузке
-#    - /var/tmp — собственный bind с noexec (остаётся постоянным), /tmp — с size=
-#    - AppArmor: массовый aa-enforce убран (ломал профили, намеренно
-#      оставленные в complain/unconfined); выводится отчёт
-#    - sysctl: rp_filter подбирается по числу интерфейсов, добавлены
-#      kexec_load_disabled, unprivileged_bpf_disabled, bpf_jit_harden,
-#      ldisc_autoload, accept_source_route
-#    - auditd: время, mount, hostname/сеть, PAM, AppArmor, входы в систему;
-#      b32-правила для модулей и bind; kmod вместо симлинков /sbin/*
-#    - unattended-upgrades: свой файл 52-… с #clear вместо перезаписи 50-…,
-#      nginx/apache больше не исключены из security-обновлений, needrestart
-#    - chrony: сохранены rtcsync, leapsectz, NTP от провайдера (DHCP)
-#    - fail2ban: ignoreip, режим aggressive; /etc/shadow 640 root:shadow
-#    - шаг 20: исправлена инструкция (root по SSH к этому моменту запрещён)
-#    - новый режим --luks: data / file / swap / remote-unlock / status
-#      и необязательная секция 19.5 в полном прогоне
-#    - шифрование всего корня: --luks encrypt-root (из rescue-системы,
-#      при необходимости создаёт раздел /boot) и --luks encrypt-root-auto
-#      (с работающей системы, шифрование при следующей загрузке) + finish
-#    - Ubuntu 26.04 (dracut): сетевая разблокировка через Tang/clevis-dracut
-#    - --luks docker: данные Docker/containerd на зашифрованном томе
+#  История изменений — CHANGELOG.md. Главное в v4:
+#    - неинтерактивный режим (--config/--yes), выбор шагов (--only/--skip),
+#      проверка (--audit), откат (--rollback), единый каталог резервных копий
+#    - исправлены: права /var/log/sudo.log, дубли в limits.conf, grep -q в
+#      пайпах под pipefail, ERR-trap в функциях, пропуск auditd при immutable
+#    - ожидание cloud-init и блокировки apt; Docker: форвардинг и UFW
+#    - chrony/pwquality — drop-in вместо перезаписи файлов дистрибутива
+#    - SSH: ключи root можно перенести администратору, порт 22 допустим,
+#      AllowAgentForwarding/PermitTunnel/PermitUserEnvironment no
+#    - auditd: b32-правила access/kexec, удаление, xattr, SUID-бинарники
+#    - journald с квотой, login.defs, необязательные faillock/AIDE/hidepid
 #
 #  ВАЖНО для VPS:
 #    Убедитесь, что у вас есть доступ к VNC/консоли провайдера
 #    на случай потери SSH-доступа во время настройки!
 # =============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
+
+SCRIPT_VERSION="4.0"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# НАСТРОЙКИ — измените под себя
+# НАСТРОЙКИ — значения по умолчанию.
+# Любую из них можно задать в файле --config (КЛЮЧ=значение) или в окружении
+# с префиксом UH_ (например UH_SSH_PORT=2222). Приоритет: окружение > --config
+# > ответы прошлого прогона (если вы согласились их использовать) > значения ниже.
 # ──────────────────────────────────────────────────────────────────────────────
-ADMIN_USER="admin"                   # значение по умолчанию, будет переспрошено
-SSH_PORT="20202"                     # значение по умолчанию, будет переспрошено
+ADMIN_USER="admin"                   # имя администратора
+SSH_PORT="20202"                     # 22 или 1024–65535
 KEY_PATH="/root/admin_ssh_key"       # куда сохранить сгенерированную пару ключей
+
+# Источник SSH-ключа администратора:
+#   root      — ключи из /root/.ssh/authorized_keys (если есть — по умолчанию)
+#   provided  — свой публичный ключ (SSH_PUBKEY)
+#   ed25519   — сгенерировать ed25519 на сервере
+#   ecdsa-521 — сгенерировать ECDSA P-521 на сервере
+SSH_KEY_SOURCE=""
+SSH_PUBKEY=""                        # для provided: "ssh-ed25519 AAAA... comment"
+ADMIN_PASSWORD_HASH=""               # для --yes: хеш пароля (openssl passwd -6 / mkpasswd)
+
+NEW_HOSTNAME=""                      # пусто — не менять
+NEW_FQDN=""                          # пусто — не задавать
+TIMEZONE=""                          # пусто — не менять (например Europe/Moscow)
+DNS_SERVERS=""                       # пусто — не менять; IPv4/IPv6 через пробел
+DNSSEC_MODE="no"                     # no | allow-downgrade | yes (allow-downgrade бывает нестабилен)
+NTP_SERVERS=""                       # свои NTP-серверы через пробел (добавляются к штатным)
+NTP_REPLACE_DEFAULTS="no"            # yes — использовать ТОЛЬКО NTP_SERVERS
+NTP_ADD_NTS="yes"                    # добавить time.cloudflare.com (NTS, аутентифицированное время)
+EXTRA_PORTS=""                       # дополнительные порты UFW: "80 443 51820/udp"
+DOCKER_ALLOW_PORTS="auto"            # порты КОНТЕЙНЕРОВ, открытые извне ("80/tcp 443/tcp");
+                                     # auto — те, что сейчас опубликованы на 0.0.0.0/::
+FAIL2BAN_IGNOREIP=""                 # свои IP/подсети, которые fail2ban не банит
 
 # Семейство адресов для SSH:
 #   any  — IPv4 + IPv6 (безопасное значение по умолчанию)
 #   inet — только IPv4 (НЕ ставьте на IPv6-only VPS — потеряете доступ!)
 SSH_ADDRESS_FAMILY="any"
 
-# Форвардинг отключён по умолчанию.
-# На VPS туннели могут быть нужны для проксирования — включайте осознанно.
+# Форвардинг SSH отключён по умолчанию.
 TCP_FORWARDING="no"
 GATEWAY_PORTS="no"
 X11_FORWARDING="no"
+AGENT_FORWARDING="no"
 
-# AppArmor: yes — перевести ВСЕ профили в enforce (как в v2). Может сломать
+# IP-форвардинг ядра: auto — включить, если найдены Docker/Podman/LXD/WireGuard
+# (иначе контейнеры теряют сеть после очередного sysctl --system); yes | no
+IP_FORWARD="auto"
+# Docker публикует порты в обход UFW. auto — при найденном Docker добавить
+# цепочку DOCKER-USER в /etc/ufw/after.rules; yes — всегда; no — не трогать
+DOCKER_UFW_FIX="auto"
+
+# /tmp: auto — tmpfs при RAM >= 2 ГБ, иначе каталог на диске с noexec; tmpfs | disk
+TMP_MODE="auto"
+# noexec на /home ломает ~/.local/bin, VS Code Remote, rustup, nvm, pipx
+HOME_NOEXEC="yes"
+# Router Advertisement IPv6: auto — оставить, если у сервера есть глобальный IPv6
+IPV6_ACCEPT_RA="auto"                # auto | yes | no
+LOG_MARTIANS="yes"                   # в некоторых сетях провайдеров очень шумно
+
+# AppArmor: yes — перевести complain-профили в enforce. Может сломать
 # программы, чьи профили дистрибутив намеренно держит в complain.
 APPARMOR_ENFORCE_ALL="no"
 
-# Сохранённые параметры прогона (используются режимом --luks)
+# Политика паролей: yes — требовать все классы символов (CIS);
+# no — только длина 16+ и словарная проверка (подход NIST SP 800-63B)
+PASSWORD_CLASSES="yes"
+PASSWORD_MAX_DAYS="365"              # срок действия пароля администратора (sudo)
+
+# Необязательные меры (по умолчанию выключены — см. README)
+ENABLE_FAILLOCK="no"                 # блокировка после 5 неверных паролей sudo/su на 15 мин
+ENABLE_AIDE="no"                     # контроль целостности файлов (aideinit — несколько минут)
+KERNEL_CMDLINE_HARDENING="no"        # slab_nomerge init_on_alloc=1 ... (нужен reboot)
+HIDEPID="no"                         # /proc: чужие процессы не видны (hidepid=invisible)
+REMOTE_SYSLOG=""                     # host:port — пересылка syslog и auditd по TCP (без TLS!)
+DISABLE_SERVICES=""                  # для --yes: какие лишние службы отключить ("cups avahi-daemon")
+
+# Сохранённые параметры прогона и резервные копии
 STATE_FILE="/etc/ubuntu_hardening.conf"
+BACKUP_ROOT="/var/backups/ubuntu_hardening"
 
 # ── Настройки LUKS (переопределяются аргументами --luks) ─────────────────────
 LUKS_NAME="securedata"               # --name        /dev/mapper/<имя>
@@ -96,9 +132,35 @@ LUKS_BACKUP_DIR="/root/luks-backup"
 LUKS_STAMP="$(date +%Y%m%d_%H%M%S)"
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Ключи, которые можно задавать через --config / UH_*
+CONFIG_KEYS=(ADMIN_USER SSH_PORT SSH_KEY_SOURCE SSH_PUBKEY ADMIN_PASSWORD_HASH
+    NEW_HOSTNAME NEW_FQDN TIMEZONE DNS_SERVERS DNSSEC_MODE NTP_SERVERS
+    NTP_REPLACE_DEFAULTS NTP_ADD_NTS EXTRA_PORTS DOCKER_ALLOW_PORTS
+    FAIL2BAN_IGNOREIP SSH_ADDRESS_FAMILY
+    TCP_FORWARDING GATEWAY_PORTS X11_FORWARDING AGENT_FORWARDING IP_FORWARD
+    DOCKER_UFW_FIX TMP_MODE HOME_NOEXEC IPV6_ACCEPT_RA LOG_MARTIANS
+    APPARMOR_ENFORCE_ALL PASSWORD_CLASSES PASSWORD_MAX_DAYS ENABLE_FAILLOCK
+    ENABLE_AIDE KERNEL_CMDLINE_HARDENING HIDEPID REMOTE_SYSLOG DISABLE_SERVICES
+    ALLOW_UNTESTED_OS)
+ALLOW_UNTESTED_OS="no"
+
+RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="${BACKUP_ROOT}/${RUN_STAMP}"
+ASSUME_YES="no"
+CURRENT_STEP=""
+declare -A STEP_WARNS=()
+declare -A STEP_STATUS=()
+declare -A STEP_NOTE=()
+declare -A TRACKED=()
+EXIT_HOOKS=()
+TMP_FILES=()
+
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
 info()    { echo -e "${GREEN}[+]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[!]${NC} $*"
+            if [[ -n "${CURRENT_STEP}" ]]; then
+                STEP_WARNS[${CURRENT_STEP}]=$(( ${STEP_WARNS[${CURRENT_STEP}]:-0} + 1 ))
+            fi; }
 error()   { echo -e "${RED}[x]${NC} $*"; exit 1; }
 section() { echo -e "\n${CYAN}===================================================${NC}";
             echo -e "${CYAN}  $*${NC}";
@@ -107,8 +169,19 @@ section() { echo -e "\n${CYAN}==================================================
 usage() {
     cat << 'EOF'
 Использование:
-  bash ubuntu_hardening.sh                    полный харденинг (интерактивно)
+  bash ubuntu_hardening.sh [опции]             полный харденинг
   bash ubuntu_hardening.sh --luks <режим> [аргументы] [опции]
+
+Опции харденинга:
+  --config <файл>       значения настроек (КЛЮЧ=значение, см. README и example.conf)
+  -y, --yes             без вопросов: значения из --config/UH_*/умолчаний.
+                        Требует ключ root или SSH_PUBKEY и ADMIN_PASSWORD_HASH
+  --only <шаги>         выполнить только эти шаги (через запятую)
+  --skip <шаги>         пропустить эти шаги
+  --list-steps          список шагов
+  --audit               проверить текущее состояние, ничего не меняя (код 1 при FAIL)
+  --rollback [метка]    восстановить файлы, изменённые прогоном (без метки — список)
+  --version             версия скрипта
 
 Режимы --luks:
   status                         состояние шифрования
@@ -148,6 +221,9 @@ usage() {
   --prepare             remote-unlock: настроить dropbear до шифрования root
 
 Примеры:
+  bash ubuntu_hardening.sh --config /root/hardening.conf --yes
+  bash ubuntu_hardening.sh --only sysctl,auditd
+  bash ubuntu_hardening.sh --audit
   bash ubuntu_hardening.sh --luks data /dev/vdb --name pgdata --mount /var/lib/postgresql
   bash ubuntu_hardening.sh --luks file /var/lib/secure.img 20G --unlock keyfile
   bash ubuntu_hardening.sh --luks remote-unlock --tang http://tang.example.net
@@ -161,32 +237,90 @@ usage() {
 EOF
 }
 
+# ── Шаги полного прогона ─────────────────────────────────────────────────────
+STEPS_ALL=(packages host key user ssh root ufw fail2ban cron mounts sysctl
+           modules coredump auditd apparmor sudo accounts perms telemetry
+           updates journald aide luks finish)
+declare -A STEP_TITLE=(
+    [packages]="0. Обновление системы и пакеты"
+    [host]="1. Имя хоста, FQDN, DNS, часовой пояс, NTP"
+    [key]="2. SSH-ключ администратора"
+    [user]="3. Пользователь-администратор"
+    [ssh]="4. Настройка SSH"
+    [root]="5. Блокировка root, su только для sudo"
+    [ufw]="6. Брандмауэр UFW"
+    [fail2ban]="7. Fail2ban"
+    [cron]="8. Защита cron/at"
+    [mounts]="9. Защита разделов"
+    [sysctl]="10. Параметры ядра (sysctl)"
+    [modules]="11. Blacklist модулей ядра"
+    [coredump]="12. Отключение core dump"
+    [auditd]="13. Auditd"
+    [apparmor]="14. AppArmor"
+    [sudo]="15. Настройка sudo"
+    [accounts]="16. Пароли, login.defs, faillock"
+    [perms]="17. Права на системные файлы"
+    [telemetry]="18. Удаление телеметрии"
+    [updates]="19. Автоматические обновления"
+    [journald]="19.1 Журнал systemd и пересылка логов"
+    [aide]="19.2 Контроль целостности (AIDE)"
+    [luks]="19.5 Шифрование LUKS (необязательно)"
+    [finish]="20. Приватный ключ, лишние службы, итог"
+)
+
 # ── Разбор аргументов ─────────────────────────────────────────────────────────
 RUN_MODE="harden"
 LUKS_ARGS=()
+CONFIG_FILE=""
+ONLY_STEPS=""
+SKIP_STEPS=""
+ROLLBACK_STAMP=""
 while (( $# )); do
     case "$1" in
-        --luks)    RUN_MODE="luks"; shift; LUKS_ARGS=("$@"); break ;;
-        -h|--help) usage; exit 0 ;;
-        *)         echo "Неизвестный аргумент: $1"; echo; usage; exit 1 ;;
+        --luks)       RUN_MODE="luks"; shift; LUKS_ARGS=("$@"); break ;;
+        --config)     CONFIG_FILE="${2:?--config: нужен путь к файлу}"; shift 2 ;;
+        -y|--yes)     ASSUME_YES="yes"; shift ;;
+        --only)       ONLY_STEPS="${2:?--only: нужен список шагов}"; shift 2 ;;
+        --skip)       SKIP_STEPS="${2:?--skip: нужен список шагов}"; shift 2 ;;
+        --audit)      RUN_MODE="audit"; shift ;;
+        --rollback)   RUN_MODE="rollback"; shift
+                      if (( $# )) && [[ "$1" != -* ]]; then ROLLBACK_STAMP="$1"; shift; fi ;;
+        --list-steps) for s in "${STEPS_ALL[@]}"; do printf '  %-10s %s\n' "$s" "${STEP_TITLE[$s]}"; done; exit 0 ;;
+        --version)    echo "ubuntu_hardening.sh ${SCRIPT_VERSION}"; exit 0 ;;
+        -h|--help)    usage; exit 0 ;;
+        *)            echo "Неизвестный аргумент: $1"; echo; usage; exit 1 ;;
     esac
 done
 
+for _list in "${ONLY_STEPS}" "${SKIP_STEPS}"; do
+    for _s in ${_list//,/ }; do
+        [[ -n "${STEP_TITLE[${_s}]:-}" ]] || error "Неизвестный шаг '${_s}' (см. --list-steps)"
+    done
+done
+
 # ──────────────────────────────────────────────────────────────────────────────
-# LUKS — функции режима --luks (и секции 19.5 полного прогона)
+# Общие функции
 # ──────────────────────────────────────────────────────────────────────────────
 
+# apt ждёт освобождения блокировки dpkg (cloud-init и unattended-upgrades
+# на только что созданном VPS держат её по несколько минут)
+APT_GET=(apt-get -o DPkg::Lock::Timeout=300)
+
 ensure_pkgs() {
-    local missing=()
+    local missing=() p
     for p in "$@"; do dpkg -s "$p" &>/dev/null || missing+=("$p"); done
     if (( ${#missing[@]} )); then
         info "Установка пакетов: ${missing[*]}"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}"
+        DEBIAN_FRONTEND=noninteractive "${APT_GET[@]}" install -y -qq "${missing[@]}"
     fi
 }
 
-confirm() {   # confirm "вопрос" -> 0 если y
+confirm() {   # confirm "вопрос" -> 0 если y; в режиме --yes — всегда "нет"
     local ans
+    if [[ "${ASSUME_YES}" == "yes" ]]; then
+        echo "$1 [y/N]: n (режим --yes)"
+        return 1
+    fi
     read -r -p "$1 [y/N]: " ans
     [[ "${ans}" =~ ^[Yy]$ ]]
 }
@@ -196,6 +330,139 @@ backup_file() {
     [[ -f "$1" ]] && cp -a "$1" "${LUKS_BACKUP_DIR}/$(basename "$1").${LUKS_STAMP}"
     return 0
 }
+
+# ── Обработчики выхода ───────────────────────────────────────────────────────
+add_exit_hook()    { EXIT_HOOKS+=("$1"); }
+remove_exit_hook() {
+    local h keep=()
+    for h in "${EXIT_HOOKS[@]}"; do [[ "$h" == "$1" ]] || keep+=("$h"); done
+    EXIT_HOOKS=("${keep[@]}")
+}
+make_tmp() {   # make_tmp <var> [каталог] — временный файл, удаляется при выходе
+    local __f
+    __f=$(mktemp "${2:-/tmp}/.uh.XXXXXX")
+    TMP_FILES+=("${__f}")
+    printf -v "$1" '%s' "${__f}"
+}
+
+# ── Резервные копии и журнал изменений для --rollback ─────────────────────────
+# track <файл>... — вызвать ДО изменения файла. Первый вызов за прогон
+# сохраняет копию (или помечает файл как новый, если его не было).
+track() {
+    local f
+    for f in "$@"; do
+        [[ -n "${TRACKED[$f]:-}" ]] && continue
+        TRACKED[$f]=1
+        mkdir -p "${BACKUP_DIR}/files"; chmod 700 "${BACKUP_ROOT}" "${BACKUP_DIR}"
+        if [[ -e "$f" || -L "$f" ]]; then
+            cp -a --parents "$f" "${BACKUP_DIR}/files/"
+            echo "saved ${f}" >> "${BACKUP_DIR}/manifest"
+        else
+            echo "new ${f}" >> "${BACKUP_DIR}/manifest"
+        fi
+    done
+}
+# Действие, которое откат должен отменить: unit-enable/unit-disable <юнит>,
+# statoverride-remove <файл>
+track_action() {
+    mkdir -p "${BACKUP_DIR}"; chmod 700 "${BACKUP_ROOT}" "${BACKUP_DIR}"
+    echo "$*" >> "${BACKUP_DIR}/manifest"
+}
+# write_file <файл> [права] < содержимое — сохранить копию и записать
+write_file() {
+    local f="$1" mode="${2:-}"
+    track "$f"
+    mkdir -p "$(dirname "$f")"
+    cat > "$f"
+    [[ -z "${mode}" ]] || chmod "${mode}" "$f"
+}
+
+# ── Чтение файла состояния / --config без source (никакого выполнения кода) ──
+kv_get() {   # kv_get <файл> <ключ>
+    [[ -r "$1" ]] || return 0
+    awk -v k="$2" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { print v }' "$1"
+}
+load_kv_file() {   # load_kv_file <файл> — только ключи из CONFIG_KEYS
+    local file="$1" line key val known
+    [[ -r "${file}" ]] || error "Не удаётся прочитать ${file}"
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        [[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "${line}" =~ ^[[:space:]]*([A-Z0-9_]+)[[:space:]]*=(.*)$ ]] \
+            || { warn "${file}: строка пропущена: ${line}"; continue; }
+        key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+        val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+        if [[ "${val}" =~ ^\"(.*)\"$ || "${val}" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
+        known="no"
+        for k in "${CONFIG_KEYS[@]}"; do [[ "$k" == "${key}" ]] && known="yes"; done
+        if [[ "${known}" == "yes" ]]; then printf -v "${key}" '%s' "${val}"
+        else warn "${file}: неизвестный ключ ${key} — пропущен"; fi
+    done < "${file}"
+}
+load_env_overrides() {
+    local k v
+    for k in "${CONFIG_KEYS[@]}"; do
+        v="UH_${k}"
+        [[ -n "${!v+x}" ]] && printf -v "$k" '%s' "${!v}"
+    done
+    return 0
+}
+
+# ask <переменная> <вопрос> — Enter оставляет текущее значение, "-" очищает.
+# В режиме --yes вопрос не задаётся.
+ask() {
+    local __var="$1" __prompt="$2" __ans
+    [[ "${ASSUME_YES}" == "yes" ]] && return 0
+    read -r -p "  ${__prompt}" __ans || __ans=""
+    if [[ "${__ans}" == "-" ]]; then printf -v "${__var}" '%s' ""
+    elif [[ -n "${__ans}" ]]; then printf -v "${__var}" '%s' "${__ans}"; fi
+}
+
+is_valid_ipv4() {
+    local ip="$1" octet
+    [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS='.'
+    for octet in ${ip}; do (( 10#${octet} <= 255 )) || return 1; done
+}
+is_valid_ip() {   # IPv4 или IPv6
+    is_valid_ipv4 "$1" && return 0
+    [[ "$1" == *:* && "$1" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    if command -v python3 &>/dev/null; then
+        python3 -I -c 'import ipaddress,sys; ipaddress.IPv6Address(sys.argv[1])' "$1" 2>/dev/null
+    fi
+}
+is_valid_hostname_fqdn() {
+    [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]
+}
+is_valid_port() {   # 22 или 1024–65535
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$1 == 22 || (10#$1 >= 1024 && 10#$1 <= 65535) ))
+}
+# Список "свой" (выбранных) ключей: строки key-type base64 [comment] без опций
+pubkeys_from_file() {   # pubkeys_from_file <authorized_keys>
+    awk '!/^[[:space:]]*(#|$)/ {
+        for (i = 1; i <= NF; i++)
+            if ($i ~ /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)$/) {
+                line = $i; for (j = i + 1; j <= NF; j++) line = line " " $j
+                print line; break
+            }
+    }' "$1" 2>/dev/null
+}
+# Проверка одной строки ключа: 0 и печать отпечатка, если ключ годен
+check_pubkey() {
+    local key="$1" tmp fp bits
+    [[ "${key}" =~ ^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa)\  ]] || return 1
+    tmp=$(mktemp)
+    printf '%s\n' "${key}" > "${tmp}"
+    fp=$(ssh-keygen -l -f "${tmp}" 2>/dev/null) || { rm -f "${tmp}"; return 1; }
+    rm -f "${tmp}"
+    if [[ "${key}" == ssh-rsa* ]]; then
+        bits=$(awk '{print $1}' <<< "${fp}")
+        (( bits >= 3072 )) || { echo "RSA ${bits} бит (нужно >= 3072)"; return 2; }
+    fi
+    echo "${fp}"
+}
+
 
 # Argon2id: память фиксируется при форматировании и потом нужна при КАЖДОЙ
 # разблокировке (в т.ч. в initramfs). Default cryptsetup — до 1 ГБ: на VPS
@@ -1125,7 +1392,7 @@ luks_mode_encrypt_root() {
     read -r -p "  Для подтверждения введите путь корневого раздела полностью: " typed
     [[ "${typed}" == "${part}" ]] || error "Подтверждение не совпало — отмена"
 
-    trap 'luks_chroot_umount' EXIT
+    add_exit_hook luks_chroot_umount
 
     # ── /boot ──
     LUKS_NEW_BOOT=""
@@ -1215,7 +1482,7 @@ luks_mode_encrypt_root() {
     grep -q "root=UUID=${fsuuid}" "${T}/boot/grub/grub.cfg" \
         || { warn "В grub.cfg корень задан не через UUID ФС (${fsuuid})"; ok="no"; }
 
-    trap - EXIT
+    remove_exit_hook luks_chroot_umount
     luks_chroot_umount
     cryptsetup close "${LUKS_ROOT_NAME}" 2>/dev/null || true
 
@@ -1997,17 +2264,7 @@ luks_main() {
     esac
 }
 
-# Запуск режима в подоболочке: ошибка внутри не обрывает полный прогон,
-# а set -e продолжает действовать (в контексте || он бы отключился)
-luks_run() {
-    local rc
-    set +e
-    ( set -e; luks_main "$@" )
-    rc=$?
-    set -e
-    (( rc == 0 )) || warn "LUKS: режим не завершён (код ${rc}) — харденинг продолжается"
-    return 0
-}
+# luks_run — определена ниже, рядом с обработчиками ошибок
 
 luks_menu() {
     luks_run status
@@ -2041,470 +2298,616 @@ luks_menu() {
     esac
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 0. Предстартовые проверки
-# ──────────────────────────────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && error "Запускайте скрипт от root"
-if [[ "${RUN_MODE}" == "harden" && ! -t 0 ]]; then
-    error "Полный прогон интерактивный — запускайте в терминале (не через пайп)"
-fi
+# ══════════════════════════════════════════════════════════════════════════════
+#  ПОЛНЫЙ ПРОГОН — служебные функции
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Лог выполнения: весь вывод дублируется в файл ─────────────────────────────
-# Секреты (приватный ключ) пишутся напрямую в /dev/tty и в лог не попадают.
-RUN_LOG="/root/hardening_${RUN_MODE}_$(date +%Y%m%d_%H%M%S).log"
-( umask 077; : > "${RUN_LOG}" )
-exec > >(tee -a "${RUN_LOG}") 2>&1
-info "Лог выполнения: ${RUN_LOG}"
+# Настройки, которые сохраняются между прогонами и служат умолчаниями
+STATE_KEYS=(ADMIN_USER SSH_PORT EXTRA_PORTS DOCKER_ALLOW_PORTS FAIL2BAN_IGNOREIP
+    NTP_SERVERS NTP_REPLACE_DEFAULTS NTP_ADD_NTS DNSSEC_MODE SSH_ADDRESS_FAMILY
+    TCP_FORWARDING GATEWAY_PORTS X11_FORWARDING AGENT_FORWARDING IP_FORWARD
+    DOCKER_UFW_FIX TMP_MODE HOME_NOEXEC IPV6_ACCEPT_RA LOG_MARTIANS
+    APPARMOR_ENFORCE_ALL PASSWORD_CLASSES PASSWORD_MAX_DAYS ENABLE_FAILLOCK
+    ENABLE_AIDE KERNEL_CMDLINE_HARDENING HIDEPID REMOTE_SYSLOG)
 
-# ── Trap: при аварийном завершении показываем строку ──────────────────────────
-trap 'echo -e "${RED}[x]${NC} Скрипт аварийно остановлен на строке ${LINENO} (см. ${RUN_LOG})"' ERR
+kv_has() { [[ -r "$1" ]] && grep -q "^$2=" "$1"; }
 
-# ── Режим --luks: только шифрование, без харденинга ──────────────────────────
-if [[ "${RUN_MODE}" == "luks" ]]; then
-    luks_main "${LUKS_ARGS[@]}"
-    exit 0
-fi
-
-# ── Проверка версии Ubuntu ────────────────────────────────────────────────────
-if [[ ! -f /etc/os-release ]]; then
-    error "Не удалось определить версию ОС (/etc/os-release не найден)"
-fi
-source /etc/os-release
-UBUNTU_VERSION="${VERSION_ID:-unknown}"
-case "${UBUNTU_VERSION}" in
-    22.04|24.04|26.04)
-        info "Версия Ubuntu: ${UBUNTU_VERSION} — поддерживается"
-        ;;
-    *)
-        warn "Версия Ubuntu: ${UBUNTU_VERSION} — не тестировалась"
-        warn "Скрипт написан для 22.04 / 24.04 / 26.04. Продолжить?"
-        read -r -p "  [y/N]: " _ver_confirm
-        [[ "${_ver_confirm}" =~ ^[Yy]$ ]] || error "Прерывание по версии ОС"
-        ;;
-esac
-
-# ── Расчёт лимитов логирования (не более 10% свободного места на диске) ───────
-LOG_PARTITION=$(df --output=target /var/log 2>/dev/null | tail -1 || df /var/log | awk 'NR==2{print $6}')
-FREE_KB=$(df -k "${LOG_PARTITION}" | awk 'NR==2{print $4}')
-LOG_QUOTA_MB=$(( FREE_KB / 10 / 1024 ))
-(( LOG_QUOTA_MB < 50   )) && LOG_QUOTA_MB=50
-(( LOG_QUOTA_MB > 2048 )) && LOG_QUOTA_MB=2048
-
-AUDIT_NUM_LOGS=5
-AUDIT_MAX_FILE_MB=$(( LOG_QUOTA_MB / AUDIT_NUM_LOGS ))
-(( AUDIT_MAX_FILE_MB < 10 )) && AUDIT_MAX_FILE_MB=10
-
-# Audit backlog — буфер в ОПЕРАТИВНОЙ памяти ядра, рассчитывается из RAM
-TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-AUDIT_BACKLOG=$(( TOTAL_RAM_KB / 1024 * 8 ))
-(( AUDIT_BACKLOG < 8192  )) && AUDIT_BACKLOG=8192
-(( AUDIT_BACKLOG > 65536 )) && AUDIT_BACKLOG=65536
-
-info "Раздел /var/log : ${LOG_PARTITION}, свободно: $(( FREE_KB / 1024 )) МБ"
-info "Квота логов (10%): ${LOG_QUOTA_MB} МБ  |  audit backlog: ${AUDIT_BACKLOG}"
-info "  auditd: ${AUDIT_NUM_LOGS} файлов × ${AUDIT_MAX_FILE_MB} МБ"
-
-# ── Имя администратора ────────────────────────────────────────────────────────
-# "admin" — одно из первых имён в словарях перебора; к тому же в sudoers
-# Ubuntu по историческим причинам есть строка "%admin ALL=(ALL) ALL"
-echo ""
-echo -e "  Имя пользователя-администратора по умолчанию: ${YELLOW}${ADMIN_USER}${NC}"
-echo "  Рекомендуется неочевидное имя (не admin/administrator/ubuntu/user)."
-echo "  (Enter — оставить ${ADMIN_USER})"
-while true; do
-    read -r -p "  Имя администратора: " _admin_name
-    if [[ -z "${_admin_name}" ]]; then
-        break
-    elif [[ "${_admin_name}" =~ ^[a-z_][a-z0-9_-]{0,30}$ && "${_admin_name}" != "root" ]]; then
-        ADMIN_USER="${_admin_name}"
-        break
-    else
-        echo -e "  ${RED}Некорректное имя.${NC} Строчные латинские буквы, цифры, _ и -, начинается с буквы."
-    fi
-done
-info "Администратор: ${ADMIN_USER}"
-
-# ── Выбор порта SSH ───────────────────────────────────────────────────────────
-echo ""
-echo -e "  SSH-порт по умолчанию: ${YELLOW}${SSH_PORT}${NC}"
-echo "  Допустимый диапазон  : 1024–65535"
-echo "  (Enter — оставить ${SSH_PORT})"
-while true; do
-    read -r -p "  Введите порт SSH: " USER_SSH_PORT
-    if [[ -z "${USER_SSH_PORT}" ]]; then
-        break
-    elif [[ "${USER_SSH_PORT}" =~ ^[0-9]+$ ]] \
-      && (( USER_SSH_PORT >= 1024 && USER_SSH_PORT <= 65535 )); then
-        SSH_PORT="${USER_SSH_PORT}"
-        break
-    else
-        echo -e "  ${RED}Некорректный порт.${NC} Введите число от 1024 до 65535."
-    fi
-done
-info "Будет использован SSH-порт: ${SSH_PORT}"
-echo ""
-
-# ── Выбор типа SSH-ключа ──────────────────────────────────────────────────────
-# Лучший вариант — свой ключ: приватная часть никогда не появляется на сервере.
-echo -e "  SSH-ключ для ${ADMIN_USER}:"
-echo -e "    1) ${GREEN}сгенерировать ed25519${NC} — современный, быстрый"
-echo "    2) сгенерировать ecdsa-521 — NIST P-521 (совместимость со старыми требованиями)"
-echo -e "    3) ${GREEN}вставить свой публичный ключ${NC} — рекомендуется (ssh-keygen -t ed25519 у себя)"
-echo "  (Enter — 1)"
-KEY_TYPE="ed25519"
-KEY_SOURCE="generated"
-USER_PUBKEY=""
-while true; do
-    read -r -p "  Выбор [1/2/3]: " _key_choice
-    case "${_key_choice}" in
-        ""|1) KEY_TYPE="ed25519";   break ;;
-        2)    KEY_TYPE="ecdsa-521"; break ;;
-        3)    read -r -p "  Вставьте строку публичного ключа (ssh-ed25519 AAAA... comment): " USER_PUBKEY
-              _pk_tmp=$(mktemp)
-              printf '%s\n' "${USER_PUBKEY}" > "${_pk_tmp}"
-              if [[ "${USER_PUBKEY}" =~ ^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa)\  ]] \
-                 && _pk_fp=$(ssh-keygen -l -f "${_pk_tmp}" 2>/dev/null); then
-                  rm -f "${_pk_tmp}"
-                  if [[ "${USER_PUBKEY}" == ssh-rsa* ]] && (( $(awk '{print $1}' <<< "${_pk_fp}") < 3072 )); then
-                      echo -e "  ${RED}RSA короче 3072 бит не принимается.${NC}"
-                      continue
-                  fi
-                  KEY_SOURCE="provided"
-                  KEY_TYPE="свой ($(awk '{print $NF}' <<< "${_pk_fp}"))"
-                  info "Ключ принят: ${_pk_fp}"
-                  break
-              fi
-              rm -f "${_pk_tmp}"
-              echo -e "  ${RED}Это не похоже на корректный публичный ключ OpenSSH.${NC}" ;;
-        *)    echo -e "  ${RED}Введите 1, 2 или 3.${NC}" ;;
-    esac
-done
-info "SSH-ключ: ${KEY_TYPE}"
-echo ""
-
-# Определяем гипервизор — некоторые настройки зависят от платформы
-HYPERVISOR="bare"
-if command -v systemd-detect-virt &>/dev/null; then
-    HYPERVISOR=$(systemd-detect-virt 2>/dev/null || echo "unknown")
-    info "Обнаружен гипервизор: ${HYPERVISOR}"
-fi
-
-section "0. Обновление системы и установка пакетов"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" \
-                        -o Dpkg::Options::="--force-confold"
-# rsyslog добавлен явно: минимальные образы 24.04+ могут идти без него,
-# а на нём построено логирование sudo (секция 15)
-apt-get install -y -qq \
-    ufw fail2ban auditd audispd-plugins \
-    libpam-pwquality unattended-upgrades apt-listchanges \
-    acl curl wget gnupg2 chrony rsyslog needrestart
-info "Пакеты установлены"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. Имя хоста, часовой пояс и синхронизация времени
-# ──────────────────────────────────────────────────────────────────────────────
-section "1. Имя хоста, часовой пояс, NTP"
-
-# ── Имя хоста ─────────────────────────────────────────────────────────────────
-CURRENT_HOSTNAME=$(hostname)
-EFFECTIVE_HOSTNAME="${CURRENT_HOSTNAME}"
-echo ""
-echo -e "  Текущее имя хоста: ${YELLOW}${CURRENT_HOSTNAME}${NC}"
-read -r -p "  Введите новое имя хоста (Enter — оставить текущее): " NEW_HOSTNAME
-if [[ -n "${NEW_HOSTNAME}" && "${NEW_HOSTNAME}" != "${CURRENT_HOSTNAME}" ]]; then
-    if [[ "${NEW_HOSTNAME}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
-        hostnamectl set-hostname "${NEW_HOSTNAME}"
-        EFFECTIVE_HOSTNAME="${NEW_HOSTNAME}"
-        info "Имя хоста задано: ${NEW_HOSTNAME}"
-    else
-        warn "Недопустимые символы в имени хоста — оставляем ${CURRENT_HOSTNAME}"
-    fi
-else
-    info "Имя хоста оставлено: ${CURRENT_HOSTNAME}"
-fi
-
-# ── FQDN ──────────────────────────────────────────────────────────────────────
-echo ""
-echo -e "  Текущий FQDN: ${YELLOW}$(hostname --fqdn 2>/dev/null || echo 'не задан')${NC}"
-echo "  Пример: ${EFFECTIVE_HOSTNAME}.example.com"
-echo "  (Enter — пропустить, FQDN не будет задан)"
-read -r -p "  Введите FQDN для этого сервера: " NEW_FQDN
-if [[ -n "${NEW_FQDN}" ]]; then
-    if [[ "${NEW_FQDN}" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
-        sed -i "/127\.0\.1\.1/d" /etc/hosts
-        echo -e "127.0.1.1\t${NEW_FQDN} ${EFFECTIVE_HOSTNAME}" >> /etc/hosts
-        hostnamectl set-hostname "${EFFECTIVE_HOSTNAME}"
-        info "FQDN задан: ${NEW_FQDN}"
-        info "/etc/hosts: 127.0.1.1 -> ${NEW_FQDN} ${EFFECTIVE_HOSTNAME}"
-    else
-        warn "Некорректный FQDN '${NEW_FQDN}' — пропускаем"
-        warn "Формат: hostname.domain.tld (например server01.example.com)"
-        sed -i "/127\.0\.1\.1/d" /etc/hosts
-        echo -e "127.0.1.1\t${EFFECTIVE_HOSTNAME}" >> /etc/hosts
-    fi
-else
-    info "FQDN не задан — обновляем /etc/hosts для short name"
-    sed -i "/127\.0\.1\.1/d" /etc/hosts
-    echo -e "127.0.1.1\t${EFFECTIVE_HOSTNAME}" >> /etc/hosts
-fi
-
-# ── Часовой пояс ──────────────────────────────────────────────────────────────
-CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone)
-echo ""
-echo -e "  Текущий часовой пояс: ${YELLOW}${CURRENT_TZ}${NC}"
-echo "  Популярные варианты:"
-echo "    Europe/Moscow   Europe/Berlin   Europe/London"
-echo "    UTC             Asia/Dubai      America/New_York"
-echo "  Полный список: timedatectl list-timezones"
-echo ""
-read -r -p "  Введите часовой пояс (Enter — оставить ${CURRENT_TZ}): " NEW_TZ
-if [[ -n "${NEW_TZ}" ]]; then
-    if timedatectl list-timezones | grep -qx "${NEW_TZ}"; then
-        timedatectl set-timezone "${NEW_TZ}"
-        info "Часовой пояс задан: ${NEW_TZ}"
-    else
-        warn "Неизвестный часовой пояс '${NEW_TZ}' — оставляем ${CURRENT_TZ}"
-        warn "Проверьте: timedatectl list-timezones | grep <регион>"
-    fi
-else
-    info "Часовой пояс оставлен: ${CURRENT_TZ}"
-fi
-
-# ── DNS ───────────────────────────────────────────────────────────────────────
-echo ""
-echo "  Текущие DNS-серверы:"
-if command -v resolvectl &>/dev/null; then
-    resolvectl status 2>/dev/null | grep "DNS Servers" | head -3 | sed 's/^/    /' || \
-        grep "^nameserver" /etc/resolv.conf | sed 's/^/    /' || echo "    (не определены)"
-else
-    grep "^nameserver" /etc/resolv.conf | sed 's/^/    /' || echo "    (не определены)"
-fi
-echo ""
-echo "  Популярные варианты:"
-echo "    Cloudflare : 1.1.1.1  1.0.0.1"
-echo "    Google     : 8.8.8.8  8.8.4.4"
-echo "    Quad9      : 9.9.9.9  149.112.112.112"
-echo "    Yandex     : 77.88.8.8  77.88.8.1"
-echo ""
-echo "  (Enter — пропустить, DNS не меняется)"
-read -r -p "  Введите основной DNS: " DNS1
-read -r -p "  Введите резервный DNS (Enter — пропустить): " DNS2
-
-is_valid_ip() {
-    local ip="$1"
-    [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    local IFS='.'
-    read -ra octets <<< "${ip}"
-    for octet in "${octets[@]}"; do
-        (( octet >= 0 && octet <= 255 )) || return 1
+load_state_defaults() {
+    local k
+    [[ -r "${STATE_FILE}" ]] || return 0
+    for k in "${STATE_KEYS[@]}"; do
+        kv_has "${STATE_FILE}" "$k" && printf -v "$k" '%s' "$(kv_get "${STATE_FILE}" "$k")"
     done
+    info "Умолчания взяты из прошлого прогона (${STATE_FILE})"
+}
+
+save_state() {
+    local k
+    track "${STATE_FILE}"
+    {
+        echo "# ubuntu_hardening.sh — параметры последнего прогона"
+        echo "# Читается построчно (КЛЮЧ=значение), не через source"
+        echo "SCRIPT_VERSION=${SCRIPT_VERSION}"
+        echo "RUN_STAMP=${RUN_STAMP}"
+        echo "KEY_SOURCE=${KEY_SOURCE:-$(kv_get "${STATE_FILE}" KEY_SOURCE)}"
+        echo "PUBKEY_BODIES=${PUBKEY_BODIES}"
+        for k in "${STATE_KEYS[@]}"; do
+            case "$k" in
+                ADMIN_USER) echo "ADMIN_USER=${APPLIED_ADMIN_USER}" ;;
+                SSH_PORT)   echo "SSH_PORT=${APPLIED_SSH_PORT}" ;;
+                *)          printf '%s=%s\n' "$k" "${!k}" ;;
+            esac
+        done
+    } > "${STATE_FILE}.tmp"
+    chmod 600 "${STATE_FILE}.tmp"
+    mv "${STATE_FILE}.tmp" "${STATE_FILE}"
+}
+
+is_yes_no() { [[ "$1" == "yes" || "$1" == "no" ]]; }
+validate_settings() {
+    local k
+    for k in TCP_FORWARDING GATEWAY_PORTS X11_FORWARDING AGENT_FORWARDING HOME_NOEXEC \
+             LOG_MARTIANS APPARMOR_ENFORCE_ALL PASSWORD_CLASSES ENABLE_FAILLOCK ENABLE_AIDE \
+             KERNEL_CMDLINE_HARDENING HIDEPID NTP_REPLACE_DEFAULTS NTP_ADD_NTS ALLOW_UNTESTED_OS; do
+        is_yes_no "${!k}" || error "${k}='${!k}': допустимо yes или no"
+    done
+    [[ "${IP_FORWARD}" =~ ^(auto|yes|no)$ ]]       || error "IP_FORWARD: auto | yes | no"
+    [[ "${DOCKER_UFW_FIX}" =~ ^(auto|yes|no)$ ]]   || error "DOCKER_UFW_FIX: auto | yes | no"
+    [[ "${IPV6_ACCEPT_RA}" =~ ^(auto|yes|no)$ ]]   || error "IPV6_ACCEPT_RA: auto | yes | no"
+    [[ "${TMP_MODE}" =~ ^(auto|tmpfs|disk)$ ]]     || error "TMP_MODE: auto | tmpfs | disk"
+    [[ "${DNSSEC_MODE}" =~ ^(no|allow-downgrade|yes)$ ]] || error "DNSSEC_MODE: no | allow-downgrade | yes"
+    [[ "${SSH_ADDRESS_FAMILY}" =~ ^(any|inet|inet6)$ ]]  || error "SSH_ADDRESS_FAMILY: any | inet | inet6"
+    [[ "${PASSWORD_MAX_DAYS}" =~ ^[0-9]+$ ]]       || error "PASSWORD_MAX_DAYS: число дней"
+    if [[ -n "${REMOTE_SYSLOG}" ]]; then
+        [[ "${REMOTE_SYSLOG}" =~ ^([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\]):[0-9]{1,5}$ ]] \
+            || error "REMOTE_SYSLOG: host:port (IPv6 — [адрес]:порт)"
+    fi
     return 0
 }
 
-# Валидация NTP-сервера: IPv4 или hostname по RFC 1123
-is_valid_ntp_server() {
-    local srv="$1"
-    is_valid_ip "${srv}" && return 0
-    [[ "${srv}" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]
+step_enabled() {
+    local s="$1"
+    if [[ -n "${ONLY_STEPS}" && ",${ONLY_STEPS}," != *",${s},"* ]]; then return 1; fi
+    [[ ",${SKIP_STEPS}," != *",${s},"* ]]
 }
 
-DNS_SERVERS=()
-if [[ -n "${DNS1}" ]]; then
-    if is_valid_ip "${DNS1}"; then
-        DNS_SERVERS+=("${DNS1}")
-    else
-        warn "Некорректный IP '${DNS1}' — DNS не изменён"
-        DNS1=""
+step_off() {   # шаг сознательно не выполняется (опция выключена)
+    STEP_STATUS[${CURRENT_STEP}]="OFF"
+    STEP_NOTE[${CURRENT_STEP}]="$1"
+    info "Пропущено: $1"
+}
+
+run_step() {
+    local s="$1"
+    if ! step_enabled "$s"; then STEP_STATUS[$s]="SKIP"; return 0; fi
+    section "${STEP_TITLE[$s]}"
+    CURRENT_STEP="$s"
+    STEP_WARNS[$s]=0
+    "step_${s}"
+    if [[ "${STEP_STATUS[$s]:-}" != "OFF" ]]; then
+        if (( ${STEP_WARNS[$s]} > 0 )); then STEP_STATUS[$s]="WARN"; else STEP_STATUS[$s]="OK"; fi
     fi
-fi
-if [[ -n "${DNS2}" ]]; then
-    if is_valid_ip "${DNS2}"; then
-        DNS_SERVERS+=("${DNS2}")
+    CURRENT_STEP=""
+}
+
+has_docker() {
+    command -v dockerd &>/dev/null || [[ -x /usr/bin/dockerd || -d /etc/docker ]]
+}
+needs_ip_forward() {
+    has_docker && return 0
+    command -v podman &>/dev/null && return 0
+    command -v lxd &>/dev/null && return 0
+    [[ -d /var/snap/lxd ]] && return 0
+    compgen -G "/etc/wireguard/*.conf" >/dev/null && return 0
+    return 1
+}
+docker_fix_active() {
+    [[ "${DOCKER_UFW_FIX}" == "yes" ]] && return 0
+    [[ "${DOCKER_UFW_FIX}" == "auto" ]] && has_docker
+}
+# Порты контейнеров, опубликованные на всех адресах: "80/tcp 443/tcp"
+docker_published_ports() {
+    command -v docker &>/dev/null || return 0
+    local out
+    out=$(docker ps --format '{{.Ports}}' 2>/dev/null) || return 0
+    grep -oE '(0\.0\.0\.0|\[?::\]?):[0-9-]+->[0-9-]+/(tcp|udp)' <<< "${out}" \
+        | sed -E 's/.*->//' | sort -u | tr '\n' ' ' || true
+}
+
+valid_port_spec() {   # 80 | 443/udp | 8000:8100/tcp
+    [[ "$1" =~ ^([0-9]+)(:([0-9]+))?(/(tcp|udp))?$ ]] || return 1
+    (( 10#${BASH_REMATCH[1]} >= 1 && 10#${BASH_REMATCH[1]} <= 65535 )) || return 1
+    (( 10#${BASH_REMATCH[3]:-1} >= 1 && 10#${BASH_REMATCH[3]:-1} <= 65535 )) || return 1
+    # диапазон требует явного протокола
+    [[ -z "${BASH_REMATCH[2]}" || -n "${BASH_REMATCH[4]}" ]]
+}
+
+admin_home() { getent passwd "${ADMIN_USER}" | cut -d: -f6; }
+
+# fstab_set <точка монтирования> <строка> — заменить запись (комментарии не трогает)
+fstab_set() {
+    local mountpoint="$1" entry="$2" tmp
+    track /etc/fstab
+    make_tmp tmp /etc
+    awk -v mp="${mountpoint}" '/^[[:space:]]*#/ || $2 != mp' /etc/fstab > "${tmp}"
+    echo "${entry}" >> "${tmp}"
+    chmod 644 "${tmp}"
+    mv "${tmp}" /etc/fstab
+    info "fstab: ${mountpoint} настроен"
+}
+
+# set_login_def <ключ> <значение> — /etc/login.defs
+set_login_def() {
+    local key="$1" val="$2"
+    track /etc/login.defs
+    if grep -qE "^[[:space:]]*${key}[[:space:]]" /etc/login.defs; then
+        sed -i -E "s|^[[:space:]]*${key}[[:space:]].*|${key}\t\t${val}|" /etc/login.defs
     else
-        warn "Некорректный IP '${DNS2}' — резервный DNS пропущен"
-        DNS2=""
+        printf '%s\t\t%s\n' "${key}" "${val}" >> /etc/login.defs
     fi
-fi
+}
 
-if [[ ${#DNS_SERVERS[@]} -gt 0 ]]; then
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        mkdir -p /etc/systemd/resolved.conf.d
-        {
-            echo "[Resolve]"
-            echo "DNS=${DNS_SERVERS[*]}"
-            echo "FallbackDNS="
-            echo "DNSOverTLS=opportunistic"
-            echo "DNSSEC=allow-downgrade"
-        } > /etc/systemd/resolved.conf.d/custom-dns.conf
-        systemctl restart systemd-resolved
-        info "DNS настроен через systemd-resolved: ${DNS_SERVERS[*]}"
-    else
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        {
-            echo "# Настроено ubuntu_hardening.sh"
-            for dns in "${DNS_SERVERS[@]}"; do
-                echo "nameserver ${dns}"
-            done
-            echo "options timeout:2 attempts:3"
-        } > /etc/resolv.conf
-        chattr +i /etc/resolv.conf
-        info "DNS записан в /etc/resolv.conf: ${DNS_SERVERS[*]}"
-        warn "/etc/resolv.conf защищён от перезаписи (chattr +i)"
+# ── Контрольная точка входа ──────────────────────────────────────────────────
+login_checkpoint() {
+    if [[ "${ASSUME_YES}" == "yes" ]]; then
+        # Человек вход не подтвердит — проверяем всё, что можно проверить локально
+        local eff
+        eff=$(sshd -T -C "user=${ADMIN_USER},host=localhost,addr=127.0.0.1" 2>/dev/null) \
+            || error "sshd -T не выполнился — root НЕ заблокирован"
+        grep -qx "authenticationmethods publickey" <<< "${eff}" || error "sshd: authenticationmethods не publickey"
+        grep -qE "^allowusers( .*)? ${ADMIN_USER}( |$)" <<< "${eff}" || error "sshd: ${ADMIN_USER} не в AllowUsers"
+        [[ -n "$(ss -Htln "sport = :${SSH_PORT}" 2>/dev/null)" ]] || error "Порт ${SSH_PORT} не слушается — root НЕ заблокирован"
+        (( $(ssh-keygen -l -f "$(admin_home)/.ssh/authorized_keys" 2>/dev/null | wc -l) > 0 )) \
+            || error "У ${ADMIN_USER} нет действующих ключей — root НЕ заблокирован"
+        warn "Режим --yes: вход проверен автоматически (конфигурация, порт, ключи), но не человеком"
+        return 0
     fi
-else
-    info "DNS не изменён"
-fi
-
-# ── NTP через Chrony ──────────────────────────────────────────────────────────
-systemctl disable --now systemd-timesyncd 2>/dev/null || true
-
-echo ""
-echo "  NTP-серверы по умолчанию:"
-echo "    pool.ntp.org (0-3) + time.cloudflare.com"
-echo ""
-echo "  Свои NTP-серверы (например: ntp.vashprovider.ru или IP)."
-echo "  Можно указать несколько через пробел."
-echo "  (Enter — использовать серверы по умолчанию)"
-read -r -p "  Введите свои NTP-серверы: " CUSTOM_NTP
-
-NTP_SOURCE_COUNT=0
-if [[ -n "${CUSTOM_NTP}" ]]; then
-    NTP_LINES=""
-    for srv in ${CUSTOM_NTP}; do
-        if is_valid_ntp_server "${srv}"; then
-            NTP_LINES+="server ${srv} iburst"$'\n'
-            NTP_SOURCE_COUNT=$(( NTP_SOURCE_COUNT + 1 ))
-        else
-            warn "Некорректный NTP-сервер '${srv}' — пропущен"
-        fi
+    echo ""
+    echo -e "${YELLOW}+------------------------------------------------------------+${NC}"
+    echo -e "${YELLOW}|  КОНТРОЛЬНАЯ ТОЧКА — проверьте вход СЕЙЧАС                 |${NC}"
+    echo -e "${YELLOW}|                                                            |${NC}"
+    echo -e "${YELLOW}|  В НОВОМ терминале (не закрывая этот):                     |${NC}"
+    echo -e "${YELLOW}|  ssh -p ${SSH_PORT} ${ADMIN_USER}@<IP>${NC}"
+    echo -e "${YELLOW}|  (сгенерированный ключ: добавьте -i ./admin_ssh_key)       |${NC}"
+    echo -e "${YELLOW}|                                                            |${NC}"
+    echo -e "${YELLOW}|  Следующий шаг заблокирует root — убедитесь, что вход      |${NC}"
+    echo -e "${YELLOW}|  под ${ADMIN_USER} работает, и проверьте sudo -v${NC}"
+    echo -e "${YELLOW}+------------------------------------------------------------+${NC}"
+    echo ""
+    local ok
+    while true; do
+        read -r -p "Вход под ${ADMIN_USER} по ключу работает? [y = продолжить / n = прервать]: " ok
+        case "${ok}" in
+            [Yy]) return 0 ;;
+            [Nn]) error "Прервано: вход не работает. Root НЕ заблокирован, исправьте проблему и перезапустите скрипт." ;;
+            *)    echo "  Введите y или n." ;;
+        esac
     done
-    if (( NTP_SOURCE_COUNT == 0 )); then
-        warn "Ни один пользовательский NTP не прошёл валидацию — используем серверы по умолчанию"
-        CUSTOM_NTP=""
-    else
-        info "Будут использованы пользовательские NTP (${NTP_SOURCE_COUNT} шт.)"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Вопросы — задаются в начале, до изменений (кроме пароля и контрольной точки)
+# ══════════════════════════════════════════════════════════════════════════════
+choose_key_source() {
+    local k fp
+    ROOT_KEYS=(); ROOT_KEY_FPS=()
+    if [[ -f /root/.ssh/authorized_keys ]]; then
+        while IFS= read -r k; do
+            if fp=$(check_pubkey "$k"); then
+                ROOT_KEYS+=("$k"); ROOT_KEY_FPS+=("${fp}")
+            elif [[ -n "${fp}" ]]; then
+                warn "Ключ root пропущен: ${fp}"
+            fi
+        done < <(pubkeys_from_file /root/.ssh/authorized_keys)
     fi
-fi
-if [[ -z "${CUSTOM_NTP}" ]]; then
-    NTP_LINES="pool 0.ubuntu.pool.ntp.org iburst
-pool 1.ubuntu.pool.ntp.org iburst
-pool 2.ubuntu.pool.ntp.org iburst
-pool 3.ubuntu.pool.ntp.org iburst
-server time.cloudflare.com iburst nts"
-    NTP_SOURCE_COUNT=5
-    info "Используются NTP-серверы по умолчанию"
-fi
 
-# minsources: при одном источнике требование "минимум 2" заблокировало бы
-# синхронизацию навсегда — подстраиваемся под реальное число серверов
-NTP_MINSOURCES=2
-(( NTP_SOURCE_COUNT < 2 )) && NTP_MINSOURCES=1
+    local def="${SSH_KEY_SOURCE}"
+    if [[ -z "${def}" ]]; then
+        if (( ${#ROOT_KEYS[@]} )); then def="root"
+        elif [[ -n "${SSH_PUBKEY}" ]]; then def="provided"
+        else def="ed25519"; fi
+    fi
 
-[[ -f /etc/chrony/chrony.conf ]] && cp /etc/chrony/chrony.conf "/etc/chrony/chrony.conf.bak.$(date +%Y%m%d%H%M%S)"
-mkdir -p /etc/chrony/conf.d /etc/chrony/sources.d
-cat > /etc/chrony/chrony.conf << EOF
-# Сгенерировано ubuntu_hardening.sh
-${NTP_LINES}
+    if [[ "${ASSUME_YES}" == "yes" ]]; then
+        case "${def}" in
+            root)     (( ${#ROOT_KEYS[@]} )) || error "SSH_KEY_SOURCE=root, но в /root/.ssh/authorized_keys нет годных ключей"
+                      PUBKEYS=("${ROOT_KEYS[@]}"); KEY_SOURCE="root"
+                      KEY_TYPE="ключи root (${#ROOT_KEYS[@]} шт.)" ;;
+            provided) fp=$(check_pubkey "${SSH_PUBKEY}") || error "SSH_PUBKEY: некорректный ключ ${fp}"
+                      PUBKEYS=("${SSH_PUBKEY}"); KEY_SOURCE="provided"; KEY_TYPE="свой ($(awk '{print $NF}' <<< "${fp}"))" ;;
+            ed25519|ecdsa-521)
+                      error "В режиме --yes ключ нельзя сгенерировать (его некому сохранить): задайте SSH_PUBKEY или ключ root" ;;
+            *)        error "SSH_KEY_SOURCE: root | provided | ed25519 | ecdsa-521" ;;
+        esac
+        info "SSH-ключ: ${KEY_TYPE}"
+        return 0
+    fi
 
-# Дополнительные конфиги и источники (в т.ч. NTP провайдера, полученные по DHCP)
-confdir /etc/chrony/conf.d
-sourcedir /run/chrony-dhcp
-sourcedir /etc/chrony/sources.d
+    local defnum
+    case "${def}" in root) defnum=1 ;; provided) defnum=2 ;; ecdsa-521) defnum=4 ;; *) defnum=3 ;; esac
+    (( ${#ROOT_KEYS[@]} )) || [[ "${defnum}" != 1 ]] || defnum=3
+    echo ""
+    echo -e "  SSH-ключ для ${ADMIN_USER}:"
+    if (( ${#ROOT_KEYS[@]} )); then
+        echo -e "    1) ${GREEN}ключи root${NC} из /root/.ssh/authorized_keys — вы уже входите с ними:"
+        for fp in "${ROOT_KEY_FPS[@]}"; do echo "         ${fp}"; done
+    fi
+    echo -e "    2) ${GREEN}вставить свой публичный ключ${NC} (ssh-keygen -t ed25519 у себя) — приватная часть не появится на сервере"
+    echo "    3) сгенерировать ed25519 на сервере"
+    echo "    4) сгенерировать ecdsa-521 на сервере (NIST P-521)"
+    echo "  (Enter — ${defnum})"
+    local ch pk
+    while true; do
+        read -r -p "  Выбор: " ch
+        ch="${ch:-${defnum}}"
+        case "${ch}" in
+            1)  if (( ${#ROOT_KEYS[@]} )); then
+                    PUBKEYS=("${ROOT_KEYS[@]}"); KEY_SOURCE="root"
+                    KEY_TYPE="ключи root (${#ROOT_KEYS[@]} шт.)"; break
+                fi
+                echo -e "  ${RED}Годных ключей root нет.${NC}" ;;
+            2)  read -r -p "  Публичный ключ (ssh-ed25519 AAAA... comment)${SSH_PUBKEY:+, Enter — из настроек}: " pk
+                pk="${pk:-${SSH_PUBKEY}}"
+                if fp=$(check_pubkey "${pk}"); then
+                    PUBKEYS=("${pk}"); KEY_SOURCE="provided"
+                    KEY_TYPE="свой ($(awk '{print $NF}' <<< "${fp}"))"
+                    info "Ключ принят: ${fp}"; break
+                fi
+                echo -e "  ${RED}Ключ не принят${NC}${fp:+: ${fp}}" ;;
+            3)  KEY_SOURCE="generated"; GEN_KEY_TYPE="ed25519";   KEY_TYPE="ed25519 (сгенерирован)"; break ;;
+            4)  KEY_SOURCE="generated"; GEN_KEY_TYPE="ecdsa-521"; KEY_TYPE="ecdsa-521 (сгенерирован)"; break ;;
+            *)  echo -e "  ${RED}Введите номер из списка.${NC}" ;;
+        esac
+    done
+    info "SSH-ключ: ${KEY_TYPE}"
+}
 
-# Drift-файл: хранит погрешность часов между перезапусками
-driftfile /var/lib/chrony/drift
-# Кэш NTS-cookie (time.cloudflare.com nts) — быстрее старт после перезагрузки
-ntsdumpdir /var/lib/chrony
-keyfile /etc/chrony/chrony.keys
+collect_answers() {
+    local prev s
 
-# Корректная обработка високосной секунды и синхронизация RTC ядром
-leapsectz right/UTC
-rtcsync
+    if step_enabled key || step_enabled user || step_enabled ssh; then
+        [[ "${ASSUME_YES}" == "yes" ]] || {
+            echo ""
+            echo "  Рекомендуется неочевидное имя администратора (не admin/administrator/ubuntu/user)."
+        }
+        prev="${ADMIN_USER}"
+        while true; do
+            ask ADMIN_USER "Имя администратора (Enter — ${ADMIN_USER}): "
+            [[ "${ADMIN_USER}" =~ ^[a-z_][a-z0-9_-]{0,30}$ && "${ADMIN_USER}" != "root" ]] && break
+            [[ "${ASSUME_YES}" == "yes" ]] && error "ADMIN_USER='${ADMIN_USER}' некорректно"
+            echo -e "  ${RED}Некорректное имя.${NC} Строчные латинские буквы, цифры, _ и -, начинается с буквы."
+            ADMIN_USER="${prev}"
+        done
+        info "Администратор: ${ADMIN_USER}"
+    fi
 
-# Разрешить большой прыжок времени только при первом старте
-makestep 1.0 3
+    if step_enabled ssh; then
+        [[ "${ASSUME_YES}" == "yes" ]] || {
+            echo ""
+            echo "  Порт SSH: 22 или 1024–65535. Нестандартный порт лишь уменьшает шум"
+            echo "  сканеров в логах; защиту дают ключи, fail2ban и UFW."
+        }
+        prev="${SSH_PORT}"
+        while true; do
+            ask SSH_PORT "Порт SSH (Enter — ${SSH_PORT}): "
+            is_valid_port "${SSH_PORT}" && break
+            [[ "${ASSUME_YES}" == "yes" ]] && error "SSH_PORT='${SSH_PORT}': 22 или 1024–65535"
+            echo -e "  ${RED}Некорректный порт.${NC} 22 или число от 1024 до 65535."
+            SSH_PORT="${prev}"
+        done
+        info "Порт SSH: ${SSH_PORT}"
+    fi
 
-# Минимум источников чтобы считать время синхронизированным
-# (1, если задан единственный пользовательский сервер)
-minsources ${NTP_MINSOURCES}
+    if step_enabled key; then
+        choose_key_source
+    fi
 
-# Не принимать источник с большим rtt (нестабильная сеть на VPS)
+    if step_enabled user && [[ "${ASSUME_YES}" == "yes" ]]; then
+        local st=""
+        id "${ADMIN_USER}" &>/dev/null && st=$(passwd -S "${ADMIN_USER}" 2>/dev/null | awk '{print $2}')
+        if [[ "${st}" != "P" && -z "${ADMIN_PASSWORD_HASH}" ]]; then
+            error "Режим --yes: у ${ADMIN_USER} нет пароля для sudo — задайте ADMIN_PASSWORD_HASH (openssl passwd -6)"
+        fi
+        [[ -z "${ADMIN_PASSWORD_HASH}" || "${ADMIN_PASSWORD_HASH}" == \$* ]] \
+            || error "ADMIN_PASSWORD_HASH должен быть crypt-хешем (\$6\$..., \$y\$...)"
+    fi
+
+    if step_enabled host; then
+        if [[ "${ASSUME_YES}" != "yes" ]]; then
+            echo ""
+            echo -e "  Текущее имя хоста: ${YELLOW}$(hostname)${NC}"
+        fi
+        prev="${NEW_HOSTNAME}"
+        while true; do
+            ask NEW_HOSTNAME "Новое имя хоста (Enter — ${NEW_HOSTNAME:-оставить текущее}): "
+            [[ -z "${NEW_HOSTNAME}" || "${NEW_HOSTNAME}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] && break
+            [[ "${ASSUME_YES}" == "yes" ]] && error "NEW_HOSTNAME='${NEW_HOSTNAME}' некорректно"
+            echo -e "  ${RED}Допустимы латинские буквы, цифры и дефис.${NC}"; NEW_HOSTNAME="${prev}"
+        done
+
+        prev="${NEW_FQDN}"
+        while true; do
+            ask NEW_FQDN "FQDN, например $(hostname).example.com (Enter — ${NEW_FQDN:-не задавать}): "
+            [[ -z "${NEW_FQDN}" ]] || is_valid_hostname_fqdn "${NEW_FQDN}" && break
+            [[ "${ASSUME_YES}" == "yes" ]] && error "NEW_FQDN='${NEW_FQDN}' некорректно"
+            echo -e "  ${RED}Формат: hostname.domain.tld${NC}"; NEW_FQDN="${prev}"
+        done
+
+        local zones
+        zones=$(timedatectl list-timezones 2>/dev/null || true)
+        if [[ "${ASSUME_YES}" != "yes" ]]; then
+            echo ""
+            echo -e "  Текущий часовой пояс: ${YELLOW}$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null)${NC}"
+            echo "  Например: Europe/Moscow  Europe/Berlin  UTC  Asia/Dubai  America/New_York"
+        fi
+        prev="${TIMEZONE}"
+        while true; do
+            ask TIMEZONE "Часовой пояс (Enter — ${TIMEZONE:-не менять}): "
+            [[ -z "${TIMEZONE}" ]] || grep -qxF -- "${TIMEZONE}" <<< "${zones}" && break
+            [[ "${ASSUME_YES}" == "yes" ]] && error "TIMEZONE='${TIMEZONE}' неизвестен (timedatectl list-timezones)"
+            echo -e "  ${RED}Неизвестный часовой пояс.${NC} Список: timedatectl list-timezones"; TIMEZONE="${prev}"
+        done
+
+        if [[ "${ASSUME_YES}" != "yes" ]]; then
+            echo ""
+            echo "  Текущие DNS-серверы:"
+            { resolvectl dns 2>/dev/null || grep "^nameserver" /etc/resolv.conf 2>/dev/null || true; } | sed 's/^/    /'
+            echo "  Например: Cloudflare 1.1.1.1 1.0.0.1 | Quad9 9.9.9.9 149.112.112.112 | Google 8.8.8.8"
+        fi
+        prev="${DNS_SERVERS}"
+        while true; do
+            ask DNS_SERVERS "DNS-серверы через пробел, IPv4/IPv6 (Enter — ${DNS_SERVERS:-не менять}): "
+            local bad=""
+            for s in ${DNS_SERVERS}; do is_valid_ip "$s" || bad+=" $s"; done
+            [[ -z "${bad}" ]] && break
+            [[ "${ASSUME_YES}" == "yes" ]] && error "DNS_SERVERS: некорректные адреса:${bad}"
+            echo -e "  ${RED}Некорректные адреса:${bad}${NC}"; DNS_SERVERS="${prev}"
+        done
+
+        if [[ "${ASSUME_YES}" != "yes" ]]; then
+            echo ""
+            echo "  NTP: штатные серверы Ubuntu сохраняются$([[ "${NTP_ADD_NTS}" == "yes" ]] && echo ", добавляется time.cloudflare.com (NTS)")."
+            echo "  Можно добавить свои (например NTP провайдера) через пробел."
+        fi
+        prev="${NTP_SERVERS}"
+        while true; do
+            ask NTP_SERVERS "Свои NTP-серверы (Enter — ${NTP_SERVERS:-нет}): "
+            local badn=""
+            for s in ${NTP_SERVERS}; do is_valid_ip "$s" || is_valid_hostname_fqdn "$s" || badn+=" $s"; done
+            [[ -z "${badn}" ]] && break
+            [[ "${ASSUME_YES}" == "yes" ]] && error "NTP_SERVERS: некорректные значения:${badn}"
+            echo -e "  ${RED}Некорректные значения:${badn}${NC}"; NTP_SERVERS="${prev}"
+        done
+        if [[ -n "${NTP_SERVERS}" && "${ASSUME_YES}" != "yes" && "${NTP_REPLACE_DEFAULTS}" == "no" ]]; then
+            confirm "  Использовать ТОЛЬКО эти NTP-серверы (отключить штатные пулы Ubuntu)?" && NTP_REPLACE_DEFAULTS="yes"
+        fi
+    fi
+
+    if step_enabled ufw; then
+        if [[ "${ASSUME_YES}" != "yes" ]]; then
+            echo ""
+            echo "  Слушающие TCP-порты:"
+            ss -Htlnp 2>/dev/null | awk '{print "    " $4 "  " $NF}' | sort -u || true
+            echo "  Слушающие UDP-порты:"
+            ss -Hulnp 2>/dev/null | awk '{print "    " $4 "  " $NF}' | sort -u || true
+            echo ""
+            echo "  UFW закроет ВСЁ входящее, кроме SSH:${SSH_PORT} и перечисленного."
+            echo "  Формат: 80 443 (TCP)  или  443/udp 51820/udp  или  8000:8100/tcp  ('-' — очистить)"
+        fi
+        prev="${EXTRA_PORTS}"
+        while true; do
+            ask EXTRA_PORTS "Дополнительные порты (Enter — ${EXTRA_PORTS:-только SSH}): "
+            local badp=""
+            for s in ${EXTRA_PORTS}; do valid_port_spec "$s" || badp+=" $s"; done
+            [[ -z "${badp}" ]] && break
+            [[ "${ASSUME_YES}" == "yes" ]] && error "EXTRA_PORTS: некорректные значения:${badp}"
+            echo -e "  ${RED}Некорректные значения:${badp}${NC}"; EXTRA_PORTS="${prev}"
+        done
+
+        if docker_fix_active; then
+            local pub; pub=$(docker_published_ports)
+            [[ "${DOCKER_ALLOW_PORTS}" == "auto" ]] && DOCKER_ALLOW_PORTS="${pub% }"
+            if [[ "${ASSUME_YES}" != "yes" ]]; then
+                echo ""
+                echo -e "  ${YELLOW}Docker публикует порты в обход UFW.${NC} Скрипт закроет их цепочкой DOCKER-USER;"
+                echo "  открытыми извне останутся только перечисленные порты КОНТЕЙНЕРОВ"
+                echo "  (для -p 8080:80 это 80/tcp). Сейчас опубликовано: ${pub:-ничего}"
+            fi
+            prev="${DOCKER_ALLOW_PORTS}"
+            while true; do
+                ask DOCKER_ALLOW_PORTS "Порты контейнеров, открытые извне (Enter — ${DOCKER_ALLOW_PORTS:-никаких}): "
+                local badd=""
+                for s in ${DOCKER_ALLOW_PORTS}; do valid_port_spec "${s//-/:}" || badd+=" $s"; done
+                [[ -z "${badd}" ]] && break
+                [[ "${ASSUME_YES}" == "yes" ]] && error "DOCKER_ALLOW_PORTS: некорректные значения:${badd}"
+                echo -e "  ${RED}Некорректные значения:${badd}${NC}"; DOCKER_ALLOW_PORTS="${prev}"
+            done
+        fi
+    fi
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ШАГИ
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 0. Обновление системы и пакеты ───────────────────────────────────────────
+step_packages() {
+    export DEBIAN_FRONTEND=noninteractive
+    "${APT_GET[@]}" update -qq
+    "${APT_GET[@]}" upgrade -y -qq -o Dpkg::Options::="--force-confdef" \
+                                   -o Dpkg::Options::="--force-confold"
+    # rsyslog явно: минимальные образы 24.04+ могут идти без него
+    "${APT_GET[@]}" install -y -qq \
+        ufw fail2ban auditd audispd-plugins \
+        libpam-pwquality unattended-upgrades apt-listchanges \
+        acl curl wget gnupg2 chrony rsyslog needrestart apparmor apparmor-utils
+    info "Пакеты установлены"
+    [[ -f /var/run/reboot-required ]] && warn "Обновление требует перезагрузки (/var/run/reboot-required)"
+    return 0
+}
+
+# ── 1. Имя хоста, FQDN, часовой пояс, DNS, NTP ───────────────────────────────
+step_host() {
+    local short; short=$(hostname)
+    if [[ -n "${NEW_HOSTNAME}" && "${NEW_HOSTNAME}" != "${short}" ]]; then
+        track /etc/hostname
+        hostnamectl set-hostname "${NEW_HOSTNAME}"
+        short="${NEW_HOSTNAME}"
+        info "Имя хоста: ${short}"
+    else
+        info "Имя хоста оставлено: ${short}"
+    fi
+
+    track /etc/hosts
+    sed -i -E '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts
+    if [[ -n "${NEW_FQDN}" ]]; then
+        printf '127.0.1.1\t%s %s\n' "${NEW_FQDN}" "${short}" >> /etc/hosts
+        info "/etc/hosts: 127.0.1.1 -> ${NEW_FQDN} ${short}"
+    else
+        printf '127.0.1.1\t%s\n' "${short}" >> /etc/hosts
+    fi
+
+    # cloud-init при перезагрузке вернул бы имя хоста и /etc/hosts из метаданных
+    if [[ -d /etc/cloud/cloud.cfg.d ]]; then
+        write_file /etc/cloud/cloud.cfg.d/99-ubuntu-hardening.cfg 644 << 'EOF'
+# ubuntu_hardening.sh: не перезаписывать имя хоста и /etc/hosts при загрузке
+preserve_hostname: true
+manage_etc_hosts: false
+EOF
+        info "cloud-init: preserve_hostname, manage_etc_hosts выключен"
+    fi
+
+    if [[ -n "${TIMEZONE}" ]]; then
+        timedatectl set-timezone "${TIMEZONE}"
+        info "Часовой пояс: ${TIMEZONE}"
+    fi
+
+    # ── DNS ──
+    if [[ -n "${DNS_SERVERS}" ]]; then
+        if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+            write_file /etc/systemd/resolved.conf.d/custom-dns.conf 644 << EOF
+# ubuntu_hardening.sh
+[Resolve]
+DNS=${DNS_SERVERS}
+FallbackDNS=
+DNSOverTLS=opportunistic
+DNSSEC=${DNSSEC_MODE}
+EOF
+            systemctl restart systemd-resolved
+            info "DNS (systemd-resolved): ${DNS_SERVERS}, DNSSEC=${DNSSEC_MODE}"
+            info "  DNS провайдера из DHCP остаются у интерфейса; чтобы убрать их — в netplan:"
+            info "  dhcp4-overrides: { use-dns: false } (и dhcp6-overrides), затем netplan apply"
+        else
+            # v3 ставила chattr +i — снимаем: неизменяемый resolv.conf ломает DHCP и обновления
+            if lsattr -d /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q i; then
+                chattr -i /etc/resolv.conf
+            fi
+            track /etc/resolv.conf
+            [[ -L /etc/resolv.conf ]] && rm -f /etc/resolv.conf
+            {
+                echo "# ubuntu_hardening.sh"
+                for s in ${DNS_SERVERS}; do echo "nameserver ${s}"; done
+                echo "options timeout:2 attempts:3"
+            } > /etc/resolv.conf
+            info "DNS записан в /etc/resolv.conf: ${DNS_SERVERS}"
+            warn "systemd-resolved не активен: DHCP-клиент может перезаписать /etc/resolv.conf"
+        fi
+    else
+        info "DNS не изменён"
+    fi
+
+    # ── NTP: chrony, файл дистрибутива не перезаписывается ──
+    ensure_pkgs chrony
+    systemctl disable --now systemd-timesyncd &>/dev/null || true
+    local conf=/etc/chrony/chrony.conf
+    # v3 заменяла chrony.conf целиком — возвращаем файл пакета
+    if grep -qs "Сгенерировано ubuntu_hardening.sh" "${conf}"; then
+        track "${conf}"
+        if [[ -f /usr/share/chrony/chrony.conf ]]; then
+            cp /usr/share/chrony/chrony.conf "${conf}"
+            info "chrony.conf восстановлен из пакета (v3 перезаписывала его)"
+        else
+            warn "chrony.conf перезаписан v3, а копии из пакета нет — оставлен как есть"
+        fi
+    fi
+
+    local count=0 lines="" s
+    for s in ${NTP_SERVERS}; do lines+="server ${s} iburst"$'\n'; count=$(( count + 1 )); done
+    if [[ "${NTP_ADD_NTS}" == "yes" ]]; then
+        lines+="server time.cloudflare.com iburst nts"$'\n'; count=$(( count + 1 ))
+    fi
+    if [[ -n "${lines}" ]]; then
+        printf '# ubuntu_hardening.sh\n%s' "${lines}" \
+            | write_file /etc/chrony/sources.d/ubuntu-hardening.sources 644
+    fi
+
+    local minsources=2
+    if [[ "${NTP_REPLACE_DEFAULTS}" == "yes" && -n "${NTP_SERVERS}" ]]; then
+        track "${conf}"
+        sed -i -E 's/^(pool|server|peer)([[:space:]])/# ubuntu_hardening: \1\2/' "${conf}"
+        local f
+        for f in /etc/chrony/sources.d/*.sources; do
+            [[ -e "$f" && "$f" != */ubuntu-hardening.sources ]] || continue
+            track "$f" "$f.disabled"; mv "$f" "$f.disabled"
+            info "Отключён источник: $f"
+        done
+        (( count < 2 )) && minsources=1
+        info "NTP: только свои серверы (${count})"
+    fi
+    # sourcedir для sources.d есть в chrony.conf Ubuntu; на всякий случай проверяем
+    local extra=""
+    grep -qsE '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d' "${conf}" \
+        || extra="sourcedir /etc/chrony/sources.d"$'\n'
+    write_file /etc/chrony/conf.d/ubuntu-hardening.conf 644 << EOF
+# ubuntu_hardening.sh — дополнение к ${conf} (файл пакета не изменяется)
+${extra}# Минимум согласных источников, чтобы считать время синхронизированным
+minsources ${minsources}
+# Не принимать источник с большой задержкой (нестабильная сеть VPS)
 maxdistance 1.5
-
-# Разрешить chronyc только с localhost
+# chronyc — только с localhost
 bindcmdaddress 127.0.0.1
 bindcmdaddress ::1
-
-# Логирование
-logdir /var/log/chrony
-log measurements statistics tracking
 EOF
+    systemctl enable chrony &>/dev/null || true
+    systemctl restart chrony || warn "chrony не перезапустился: journalctl -u chrony"
+    sleep 2
+    chronyc makestep &>/dev/null || true
+    local synced; synced=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)
+    if [[ "${synced}" == "yes" ]]; then info "NTP синхронизирован"
+    else info "NTP: синхронизация ещё идёт (chronyc tracking)"; fi
+}
 
-systemctl enable --now chrony
-sleep 2
-chronyc makestep 2>/dev/null || true
-
-info "Chrony запущен и настроен"
-echo ""
-echo "  Статус синхронизации времени:"
-timedatectl show --property=NTPSynchronized --value 2>/dev/null | \
-    grep -q "yes" && echo -e "    NTP синхронизирован: ${GREEN}yes${NC}" \
-                  || echo -e "    NTP синхронизирован: ${YELLOW}ожидание...${NC}"
-echo ""
-chronyc tracking 2>/dev/null | grep -E "Reference ID|System time|Leap status" \
-    | sed 's/^/    /' || true
-echo ""
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. SSH-ключ администратора
-# ──────────────────────────────────────────────────────────────────────────────
-section "2. SSH-ключ администратора (${KEY_TYPE})"
-
-if [[ "${KEY_SOURCE}" == "provided" ]]; then
-    # Приватная часть ключа на сервере не появляется вообще
-    rm -f "${KEY_PATH}"
-    printf '%s\n' "${USER_PUBKEY}" > "${KEY_PATH}.pub"
-    chmod 644 "${KEY_PATH}.pub"
-    info "Используется ваш публичный ключ (${KEY_PATH}.pub)"
-else
-    rm -f "${KEY_PATH}" "${KEY_PATH}.pub"
-
-    echo ""
-    echo -e "${YELLOW}Придумайте надёжный пароль для приватного ключа.${NC}"
-    echo -e "${YELLOW}Он будет запрашиваться при каждом подключении по SSH.${NC}"
-    echo ""
-    if [[ "${KEY_TYPE}" == "ed25519" ]]; then
-        ssh-keygen -t ed25519 -a 100 \
-                   -f "${KEY_PATH}" \
-                   -C "${ADMIN_USER}@$(hostname)-$(date +%Y%m%d)"
-    else
-        ssh-keygen -t ecdsa -b 521 -a 100 \
-                   -f "${KEY_PATH}" \
-                   -C "${ADMIN_USER}@$(hostname)-$(date +%Y%m%d)"
+# ── 2. SSH-ключ ──────────────────────────────────────────────────────────────
+step_key() {
+    if [[ "${KEY_SOURCE}" != "generated" ]]; then
+        info "Ключ: ${KEY_TYPE} — приватная часть на сервере не создаётся"
+        return 0
     fi
-
-    chmod 600 "${KEY_PATH}"
-    chmod 644 "${KEY_PATH}.pub"
-
-    info "Ключевая пара создана:"
-    info "  Приватный ключ : ${KEY_PATH}"
-    info "  Публичный ключ : ${KEY_PATH}.pub"
+    rm -f "${KEY_PATH}" "${KEY_PATH}.pub"
+    echo ""
+    echo -e "${YELLOW}Придумайте надёжный пароль для приватного ключа — он будет${NC}"
+    echo -e "${YELLOW}запрашиваться при каждом подключении по SSH.${NC}"
+    echo ""
+    local comment; comment="${ADMIN_USER}@$(hostname)-$(date +%Y%m%d)"
+    if [[ "${GEN_KEY_TYPE}" == "ed25519" ]]; then
+        ssh-keygen -t ed25519 -a 100 -f "${KEY_PATH}" -C "${comment}"
+    else
+        ssh-keygen -t ecdsa -b 521 -a 100 -f "${KEY_PATH}" -C "${comment}"
+    fi
+    chmod 600 "${KEY_PATH}"; chmod 644 "${KEY_PATH}.pub"
+    PUBKEYS=("$(cat "${KEY_PATH}.pub")")
 
     echo ""
     echo -e "${YELLOW}+------------------------------------------------------------+${NC}"
     echo -e "${YELLOW}|  СКАЧАЙТЕ ПРИВАТНЫЙ КЛЮЧ СЕЙЧАС!                           |${NC}"
-    echo -e "${YELLOW}|                                                            |${NC}"
     echo -e "${YELLOW}|  С другого терминала (root по SSH пока разрешён):          |${NC}"
     echo -e "${YELLOW}|  scp root@<IP>:${KEY_PATH} ./admin_ssh_key${NC}"
-    echo -e "${YELLOW}|                                                            |${NC}"
     echo -e "${YELLOW}|  Или скопируйте текст ниже — он выводится только на экран  |${NC}"
     echo -e "${YELLOW}|  и НЕ записывается в лог выполнения.                       |${NC}"
     echo -e "${YELLOW}+------------------------------------------------------------+${NC}"
     echo ""
-    # Ключ — мимо tee: в лог /root/hardening_*.log он попасть не должен
-    sleep 0.3   # дать tee вывести рамку выше, чтобы порядок на экране не сбился
+    sleep 0.3   # дать tee вывести рамку выше, прежде чем писать мимо него
     {
         echo "--- ПРИВАТНЫЙ КЛЮЧ (сохраните в безопасное место) ---"
         cat "${KEY_PATH}"
@@ -2514,46 +2917,28 @@ else
     echo "--- ПУБЛИЧНЫЙ КЛЮЧ ---"
     cat "${KEY_PATH}.pub"
     echo "----------------------"
-    echo ""
-
     read -r -p "Нажмите Enter, когда сохраните приватный ключ..."
-fi
+}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. Создание пользователя-администратора
-# ──────────────────────────────────────────────────────────────────────────────
-section "3. Создание пользователя ${ADMIN_USER}"
-
-if id "${ADMIN_USER}" &>/dev/null; then
-    warn "Пользователь ${ADMIN_USER} уже существует — обновляем SSH-ключ"
-else
-    # Группа с именем пользователя может уже существовать на Ubuntu
-    # (например, "admin" — встроенная группа). Используем её как primary group.
-    if getent group "${ADMIN_USER}" &>/dev/null; then
-        useradd -m -s /bin/bash -g "${ADMIN_USER}" "${ADMIN_USER}"
-        warn "Группа '${ADMIN_USER}' уже существовала — использована как primary group"
-    else
-        useradd -m -s /bin/bash "${ADMIN_USER}"
+# ── 3. Пользователь-администратор ────────────────────────────────────────────
+write_pwquality() {
+    ensure_pkgs libpam-pwquality
+    # v3 перезаписывала pwquality.conf целиком — возвращаем файл к умолчаниям
+    if grep -qs "Сгенерировано ubuntu_hardening.sh" /etc/security/pwquality.conf; then
+        write_file /etc/security/pwquality.conf 644 << 'EOF'
+# Настройки — в /etc/security/pwquality.conf.d/ (ubuntu_hardening.sh)
+EOF
     fi
-    info "Пользователь ${ADMIN_USER} создан"
-fi
-
-# usermod вынесен из ветки else: если пользователь существовал,
-# но не был в sudo — раньше он туда не попадал (баг)
-usermod -aG sudo "${ADMIN_USER}"
-info "Пользователь ${ADMIN_USER} состоит в группе sudo"
-
-# ИСПРАВЛЕНО: политика паролей применяется ДО задания пароля (раньше
-# секция 16 шла после passwd и на пароль администратора не влияла).
-# enforce_for_root обязателен: passwd запускается от root, а для root
-# pwquality по умолчанию только предупреждает и принимает слабый пароль.
-cat > /etc/security/pwquality.conf << 'EOF'
-# Сгенерировано ubuntu_hardening.sh
+    local classes=""
+    if [[ "${PASSWORD_CLASSES}" == "yes" ]]; then
+        classes=$'dcredit = -1\nucredit = -1\nlcredit = -1\nocredit = -1'
+    fi
+    # enforce_for_root обязателен: passwd запускается от root, а для root
+    # pwquality по умолчанию только предупреждает
+    write_file /etc/security/pwquality.conf.d/50-ubuntu-hardening.conf 644 << EOF
+# ubuntu_hardening.sh
 minlen = 16
-dcredit = -1
-ucredit = -1
-lcredit = -1
-ocredit = -1
+${classes}
 maxrepeat = 3
 dictcheck = 1
 usercheck = 1
@@ -2561,99 +2946,125 @@ gecoscheck = 1
 enforce_for_root
 retry = 3
 EOF
-info "Политика паролей: минимум 16 символов, все классы символов"
+}
 
-# passwd в цикле: 3 ошибки ввода возвращают ≠0 и при set -e
-# раньше роняли весь скрипт на середине
-warn "Задайте пароль для ${ADMIN_USER} (нужен только для sudo, не для SSH):"
-until passwd "${ADMIN_USER}"; do
-    warn "Пароль не задан (несовпадение или слабый) — попробуйте ещё раз"
-done
-
-SSH_DIR="/home/${ADMIN_USER}/.ssh"
-AUTH_KEYS="${SSH_DIR}/authorized_keys"
-mkdir -p "${SSH_DIR}"
-touch "${AUTH_KEYS}"
-# Ключ прошлого прогона этого скрипта больше не нужен — убираем его
-# (ключи, добавленные вручную, не трогаем)
-if [[ -f "${STATE_FILE}" ]]; then
-    _old_pub=$(awk -F= '$1=="PUBKEY_BODY"{print $2}' "${STATE_FILE}")
-    if [[ -n "${_old_pub}" ]]; then
-        grep -vF -- "${_old_pub}" "${AUTH_KEYS}" > "${AUTH_KEYS}.tmp" || true
-        mv "${AUTH_KEYS}.tmp" "${AUTH_KEYS}"
+step_user() {
+    if id "${ADMIN_USER}" &>/dev/null; then
+        info "Пользователь ${ADMIN_USER} уже существует"
+    elif getent group "${ADMIN_USER}" &>/dev/null; then
+        # группа "admin" встроена в Ubuntu — используем её как основную
+        useradd -m -s /bin/bash -g "${ADMIN_USER}" "${ADMIN_USER}"
+        warn "Группа '${ADMIN_USER}' уже существовала — использована как основная"
+    else
+        useradd -m -s /bin/bash "${ADMIN_USER}"
+        info "Пользователь ${ADMIN_USER} создан"
     fi
-fi
-cat "${KEY_PATH}.pub" >> "${AUTH_KEYS}"
-sort -u "${AUTH_KEYS}" -o "${AUTH_KEYS}"
-chown -R "${ADMIN_USER}:$(id -gn "${ADMIN_USER}")" "${SSH_DIR}"
-chmod 700 "${SSH_DIR}"
-chmod 600 "${AUTH_KEYS}"
-info "Публичный ключ установлен для ${ADMIN_USER}"
+    usermod -aG sudo "${ADMIN_USER}"
+    info "${ADMIN_USER} состоит в группе sudo"
 
-# Параметры прогона — для режима --luks и следующего запуска
-cat > "${STATE_FILE}" << EOF
-# ubuntu_hardening.sh — параметры последнего прогона
-ADMIN_USER=${ADMIN_USER}
-SSH_PORT=${SSH_PORT}
-PUBKEY_BODY=$(awk '{print $2}' "${KEY_PATH}.pub")
-EOF
-chmod 600 "${STATE_FILE}"
+    # Политика паролей — ДО задания пароля
+    write_pwquality
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. SSH hardening
-# ──────────────────────────────────────────────────────────────────────────────
-section "4. Настройка SSH (/etc/ssh/sshd_config)"
+    local st; st=$(passwd -S "${ADMIN_USER}" 2>/dev/null | awk '{print $2}')
+    if [[ -n "${ADMIN_PASSWORD_HASH}" ]]; then
+        usermod -p "${ADMIN_PASSWORD_HASH}" "${ADMIN_USER}"
+        info "Пароль ${ADMIN_USER} задан из ADMIN_PASSWORD_HASH"
+    elif [[ "${st}" != "P" ]] || confirm "  У ${ADMIN_USER} уже есть пароль. Сменить?"; then
+        warn "Задайте пароль для ${ADMIN_USER} (нужен для sudo, не для SSH):"
+        # 3 ошибки ввода дают код ≠0 — без цикла set -e уронил бы скрипт
+        until passwd "${ADMIN_USER}"; do
+            echo "  Пароль не задан (несовпадение или слабый) — попробуйте ещё раз"
+        done
+    fi
 
-cat > /etc/ssh/my_banner << 'EOF'
+    local home; home=$(admin_home)
+    local ssh_dir="${home}/.ssh" ak="${home}/.ssh/authorized_keys"
+    mkdir -p "${ssh_dir}"
+    track "${ak}"
+    touch "${ak}"
+
+    if (( ${#PUBKEYS[@]} )); then
+        local new_bodies="" k body old
+        for k in "${PUBKEYS[@]}"; do new_bodies+="${new_bodies:+ }$(awk '{print $2}' <<< "$k")"; done
+        # Ключи, поставленные прошлым прогоном и больше не выбранные, убираем
+        # (ключи, добавленные вручную, не трогаем)
+        local old_bodies; old_bodies="$(kv_get "${STATE_FILE}" PUBKEY_BODIES) $(kv_get "${STATE_FILE}" PUBKEY_BODY)"
+        for old in ${old_bodies}; do
+            [[ " ${new_bodies} " == *" ${old} "* ]] && continue
+            if grep -qF -- "${old}" "${ak}"; then
+                grep -vF -- "${old}" "${ak}" > "${ak}.tmp" || true
+                mv "${ak}.tmp" "${ak}"
+                info "Убран ключ прошлого прогона: ${old:0:24}…"
+            fi
+        done
+        for k in "${PUBKEYS[@]}"; do
+            body=$(awk '{print $2}' <<< "$k")
+            if grep -qF -- "${body}" "${ak}"; then
+                info "Ключ уже установлен: ${body:0:24}…"
+            else
+                printf '%s\n' "$k" >> "${ak}"
+                info "Ключ добавлен: ${body:0:24}…"
+            fi
+        done
+        PUBKEY_BODIES="${new_bodies}"
+    else
+        PUBKEY_BODIES="$(kv_get "${STATE_FILE}" PUBKEY_BODIES)"
+        [[ -n "${PUBKEY_BODIES}" ]] || PUBKEY_BODIES="$(kv_get "${STATE_FILE}" PUBKEY_BODY)"
+        info "Шаг key не выполнялся — authorized_keys не меняется"
+    fi
+
+    chown -R "${ADMIN_USER}:$(id -gn "${ADMIN_USER}")" "${ssh_dir}"
+    chmod 700 "${ssh_dir}"; chmod 600 "${ak}"
+    local nkeys; nkeys=$(ssh-keygen -l -f "${ak}" 2>/dev/null | wc -l)
+    (( nkeys > 0 )) || error "В ${ak} нет ни одного действующего ключа"
+    info "${ak}: ключей ${nkeys}"
+
+    APPLIED_ADMIN_USER="${ADMIN_USER}"
+    save_state
+}
+
+# ── 4. SSH ───────────────────────────────────────────────────────────────────
+step_ssh() {
+    id "${ADMIN_USER}" &>/dev/null || error "Пользователя ${ADMIN_USER} нет — сначала шаг user"
+    local ak; ak="$(admin_home)/.ssh/authorized_keys"
+    (( $(ssh-keygen -l -f "${ak}" 2>/dev/null | wc -l) > 0 )) \
+        || error "В ${ak} нет действующих ключей — sshd не трогаем"
+
+    write_file /etc/ssh/my_banner 644 << 'EOF'
 *******************************************************************
 *  WARNING: Unauthorized access is strictly prohibited.           *
 *  All sessions are monitored and logged.                         *
 *  Disconnect immediately if you are not an authorized user.      *
 *******************************************************************
 EOF
+    track /etc/ssh/sshd_config
+    # /etc/ssh — 755 (иначе ломается ssh-клиент у обычных пользователей)
+    chmod 755 /etc/ssh
+    find /etc/ssh -maxdepth 1 -type f -name "ssh_host_*_key"     -exec chmod 600 {} \;
+    find /etc/ssh -maxdepth 1 -type f -name "ssh_host_*_key.pub" -exec chmod 644 {} \;
 
-cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
+    # KEX: постквантовые гибриды первыми, только то, что знает этот OpenSSH
+    local supported kex_list="" k
+    supported=$(ssh -Q kex 2>/dev/null || true)
+    for k in mlkem768x25519-sha256 sntrup761x25519-sha512 sntrup761x25519-sha512@openssh.com \
+             curve25519-sha256 curve25519-sha256@libssh.org ecdh-sha2-nistp521; do
+        grep -qxF -- "$k" <<< "${supported}" && kex_list+="${kex_list:+,}$k"
+    done
+    [[ -n "${kex_list}" ]] || kex_list="curve25519-sha256,curve25519-sha256@libssh.org"
+    info "SSH KEX: ${kex_list}"
 
-# ИСПРАВЛЕНО: было chmod 700 /etc/ssh — это ломало ssh-КЛИЕНТ для
-# непривилегированных пользователей (нет доступа к /etc/ssh/ssh_config).
-# Каталог должен быть 755, приватность обеспечивают права на сами файлы.
-chmod 755 /etc/ssh
-chmod 600 /etc/ssh/sshd_config
-find /etc/ssh -maxdepth 1 -type f -name "ssh_host_*_key"     -exec chmod 600 {} \;
-find /etc/ssh -maxdepth 1 -type f -name "ssh_host_*_key.pub" -exec chmod 644 {} \;
+    local tmp; make_tmp tmp /etc/ssh
+    cat > "${tmp}" << EOF
+# Generated by ubuntu_hardening.sh v${SCRIPT_VERSION}
+# sshd берёт ПЕРВОЕ значение директивы: наши настройки стоят выше Include
+# и не перебиваются drop-in файлами (cloud-init и т.п.).
 
-# ── KEX: постквантовые гибриды первыми, только то, что знает этот OpenSSH ────
-# ИСПРАВЛЕНО: v2 оставляла лишь curve25519/nistp521 и тем самым ОТКЛЮЧАЛА
-# постквантовый обмен ключами, включённый в OpenSSH по умолчанию
-# (sntrup761x25519 с 9.0, mlkem768x25519 с 9.9; 24.04 = 9.6, 26.04 = 10.x).
-# Защищает записанный сегодня трафик от расшифровки в будущем.
-SUPPORTED_KEX=$(ssh -Q kex 2>/dev/null || true)
-KEX_LIST=""
-for _kex in mlkem768x25519-sha256 \
-            sntrup761x25519-sha512 sntrup761x25519-sha512@openssh.com \
-            curve25519-sha256 curve25519-sha256@libssh.org \
-            ecdh-sha2-nistp521; do
-    if grep -qx "${_kex}" <<< "${SUPPORTED_KEX}"; then
-        KEX_LIST+="${KEX_LIST:+,}${_kex}"
-    fi
-done
-[[ -n "${KEX_LIST}" ]] || KEX_LIST="curve25519-sha256,curve25519-sha256@libssh.org"
-info "SSH KEX: ${KEX_LIST}"
-
-SSHD_TMP=$(mktemp /etc/ssh/sshd_config.XXXXXX)
-cat > "${SSHD_TMP}" << EOF
-# Generated by ubuntu_hardening.sh (VPS edition, v3)
-# sshd берёт ПЕРВОЕ встреченное значение директивы, поэтому наши настройки
-# стоят выше Include и не перебиваются drop-in файлами (cloud-init и т.п.).
-
-# Порт и адреса
 Port ${SSH_PORT}
-# any = IPv4+IPv6; inet = только IPv4 (настраивается переменной в скрипте)
 AddressFamily ${SSH_ADDRESS_FAMILY}
 
 # Криптография — только современные алгоритмы
 HostKeyAlgorithms ssh-ed25519,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256
-KexAlgorithms ${KEX_LIST}
+KexAlgorithms ${kex_list}
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 
@@ -2662,11 +3073,13 @@ PermitRootLogin no
 PasswordAuthentication no
 PermitEmptyPasswords no
 KbdInteractiveAuthentication no
+HostbasedAuthentication no
+IgnoreRhosts yes
 UsePAM yes
 AuthenticationMethods publickey
+PermitUserEnvironment no
 
 # Тайм-ауты и лимиты
-# LoginGraceTime 0 = без лимита (баг в оригинале), нужно 30
 LoginGraceTime 30
 MaxAuthTries 3
 MaxSessions 5
@@ -2674,221 +3087,210 @@ MaxStartups 5:30:20
 ClientAliveInterval 300
 ClientAliveCountMax 2
 
-# Только наш пользователь
 AllowUsers ${ADMIN_USER}
 
-# Форвардинг (отключён; включайте переменными в начале скрипта если нужны туннели)
+# Форвардинг (настраивается переменными в начале скрипта / --config)
 AllowTcpForwarding ${TCP_FORWARDING}
+AllowAgentForwarding ${AGENT_FORWARDING}
 GatewayPorts ${GATEWAY_PORTS}
 X11Forwarding ${X11_FORWARDING}
+PermitTunnel no
 
-# Прочее
 PrintMotd no
 PrintLastLog yes
 Banner /etc/ssh/my_banner
 AcceptEnv LANG LC_*
-Subsystem sftp /usr/lib/openssh/sftp-server
+# internal-sftp: без отдельного бинарника, работает и в chroot
+Subsystem sftp internal-sftp
 
-# Скрыть версию SSH от сканеров
 DebianBanner no
 VersionAddendum none
 
-# Verbose пишет fingerprint ключа при каждом входе — удобно для аудита
 SyslogFacility AUTH
 LogLevel VERBOSE
 
-# Drop-in файлы — В КОНЦЕ: добавляют только то, что не задано выше
+# Drop-in — В КОНЦЕ: добавляют только то, что не задано выше
 Include /etc/ssh/sshd_config.d/*.conf
 EOF
 
-# Port и ListenAddress, в отличие от остальных директив, НАКАПЛИВАЮТСЯ —
-# drop-in с ними открыл бы второй порт. Такие drop-in убираем.
-if [[ -d /etc/ssh/sshd_config.d ]]; then
-    if grep -rqsE "^\s*(Port|ListenAddress)\s" /etc/ssh/sshd_config.d/ 2>/dev/null; then
-        mkdir -p /root/sshd_config.d.bak
-        grep -rlsE "^\s*(Port|ListenAddress)\s" /etc/ssh/sshd_config.d/ | while read -r f; do
-            mv "$f" /root/sshd_config.d.bak/
-            warn "Drop-in с Port/ListenAddress перемещён в /root/sshd_config.d.bak: $(basename "$f")"
-        done
+    # Port и ListenAddress НАКАПЛИВАЮТСЯ — drop-in с ними открыл бы второй порт
+    local f
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            track "$f"
+            mkdir -p "${BACKUP_DIR}/moved"
+            mv "$f" "${BACKUP_DIR}/moved/"
+            warn "Drop-in с Port/ListenAddress убран (копия в ${BACKUP_DIR}): $(basename "$f")"
+        done < <(grep -rlsE '^[[:space:]]*(Port|ListenAddress)[[:space:]]' /etc/ssh/sshd_config.d/ || true)
     fi
-fi
 
-# ИСПРАВЛЕНО: проверяем конфиг ДО установки — раньше битый файл оставался
-# на месте, и следующий рестарт sshd (например, при обновлении) ронял SSH
-mkdir -p /run/sshd
-if sshd -t -f "${SSHD_TMP}"; then
-    chmod 600 "${SSHD_TMP}"
-    mv "${SSHD_TMP}" /etc/ssh/sshd_config
-    info "sshd_config прошёл валидацию и установлен"
-else
-    rm -f "${SSHD_TMP}"
-    error "Ошибка в сгенерированном sshd_config — текущая конфигурация не тронута"
-fi
-
-# Итоговая (эффективная) конфигурация: порт ровно один, пароли выключены
-SSHD_EFFECTIVE=$(sshd -T 2>/dev/null || true)
-_ports=$(awk '$1=="port"{print $2}' <<< "${SSHD_EFFECTIVE}" | sort -u | tr '\n' ' ')
-[[ "${_ports}" == "${SSH_PORT} " ]] || warn "sshd слушает порты: ${_ports}— ожидался только ${SSH_PORT}"
-grep -qx "passwordauthentication no" <<< "${SSHD_EFFECTIVE}" \
-    || error "PasswordAuthentication не выключен в итоговой конфигурации sshd"
-
-# Если UFW уже включён (бывает в образах провайдеров) — открываем новый порт
-# ДО перезапуска sshd, иначе контрольная точка входа не пройдёт
-if ufw status 2>/dev/null | grep -q "^Status: active"; then
-    ufw limit "${SSH_PORT}/tcp" comment "SSH rate-limited" >/dev/null
-    info "UFW активен — порт ${SSH_PORT}/tcp открыт заранее"
-fi
-
-# ── ГЛАВНЫЙ ФИКС «порт не поменялся»: socket-активация SSH ────────────────────
-# Ubuntu 22.10+ / 24.04 по умолчанию запускают SSH через ssh.socket.
-# В этом режиме порт задаёт systemd-сокет, а Port в sshd_config ИГНОРИРУЕТСЯ.
-# Переключаемся на классический режим службы.
-if systemctl is-enabled ssh.socket &>/dev/null; then
-    warn "Обнаружена socket-активация SSH (ssh.socket) — отключаем"
-    systemctl disable --now ssh.socket
-    systemctl enable ssh.service 2>/dev/null || true
-    systemctl daemon-reload
-    info "ssh.socket отключён: порт теперь управляется через sshd_config"
-fi
-
-# Имя службы SSH отличается в зависимости от версии Ubuntu
-if systemctl list-units --type=service --state=running --all | grep -q "sshd.service"; then
-    SSH_SERVICE="sshd"
-else
-    SSH_SERVICE="ssh"
-fi
-systemctl restart "${SSH_SERVICE}"
-systemctl is-active --quiet "${SSH_SERVICE}" \
-    && info "SSH (${SSH_SERVICE}) перезапущен, активен на порту ${SSH_PORT}" \
-    || error "SSH не запустился! Проверьте: journalctl -xe -u ${SSH_SERVICE}"
-
-# Проверяем что порт реально слушается
-sleep 1
-ss -tlnp | grep -q ":${SSH_PORT}\b" \
-    && info "Порт ${SSH_PORT} подтверждён в ss" \
-    || warn "Порт ${SSH_PORT} не найден в ss — проверьте journalctl -xe -u ${SSH_SERVICE}"
-
-# ── КОНТРОЛЬНАЯ ТОЧКА: проверка входа ДО блокировки root ──────────────────────
-# Раньше вход проверялся только в самом конце (секция 20), а root
-# блокировался в секции 5 — при проблеме с ключом можно было потерять доступ.
-echo ""
-echo -e "${YELLOW}+------------------------------------------------------------+${NC}"
-echo -e "${YELLOW}|  КОНТРОЛЬНАЯ ТОЧКА — проверьте вход СЕЙЧАС                |${NC}"
-echo -e "${YELLOW}|                                                            |${NC}"
-echo -e "${YELLOW}|  В НОВОМ терминале (не закрывая этот):                     |${NC}"
-echo -e "${YELLOW}|  ssh -p ${SSH_PORT} -i ./admin_ssh_key ${ADMIN_USER}@<IP>          |${NC}"
-echo -e "${YELLOW}|                                                            |${NC}"
-echo -e "${YELLOW}|  Следующий шаг заблокирует root — убедитесь, что вход      |${NC}"
-echo -e "${YELLOW}|  под ${ADMIN_USER} работает!                               |${NC}"
-echo -e "${YELLOW}+------------------------------------------------------------+${NC}"
-echo ""
-while true; do
-    read -r -p "Вход под ${ADMIN_USER} по ключу работает? [y = продолжить / n = прервать]: " _login_ok
-    case "${_login_ok}" in
-        [Yy]) break ;;
-        [Nn]) error "Прервано пользователем: вход не работает. Root НЕ заблокирован, исправьте проблему и перезапустите скрипт." ;;
-        *)    echo "  Введите y или n." ;;
-    esac
-done
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. Блокировка root
-# ──────────────────────────────────────────────────────────────────────────────
-section "5. Блокировка учётной записи root"
-
-passwd -l root
-info "Пароль root заблокирован"
-
-# su — только члены группы sudo
-# ИСПРАВЛЕНО: в Ubuntu строка выглядит как "# auth       required   pam_wheel.so"
-# (пробел после #). Старый grep "^#auth" её не находил, а проверка
-# "pam_wheel.so есть в файле" срабатывала на ЗАКОММЕНТИРОВАННУЮ строку —
-# в итоге su не ограничивался вообще. Без group=sudo pam_wheel проверял бы
-# группу root, а не sudo.
-PAM_SU=/etc/pam.d/su
-if [[ -f "${PAM_SU}" ]]; then
-    cp "${PAM_SU}" "${PAM_SU}.bak.$(date +%Y%m%d%H%M%S)"
-    if grep -qE '^\s*auth\s+required\s+pam_wheel\.so' "${PAM_SU}"; then
-        # уже активна — гарантируем group=sudo
-        grep -qE '^\s*auth\s+required\s+pam_wheel\.so.*group=sudo' "${PAM_SU}" \
-            || sed -i -E 's/^(\s*auth\s+required\s+pam_wheel\.so)(.*)$/\1\2 group=sudo/' "${PAM_SU}"
-    elif grep -qE '^#\s*auth\s+required\s+pam_wheel\.so\s*$' "${PAM_SU}"; then
-        sed -i -E 's/^#\s*auth\s+required\s+pam_wheel\.so\s*$/auth       required   pam_wheel.so group=sudo/' "${PAM_SU}"
+    # Проверка ДО установки: битый конфиг не должен попасть на место
+    mkdir -p /run/sshd
+    if sshd -t -f "${tmp}"; then
+        chmod 600 "${tmp}"
+        mv "${tmp}" /etc/ssh/sshd_config
+        info "sshd_config прошёл проверку и установлен"
     else
-        # строки нет вовсе — вставляем перед @include common-auth
-        sed -i '0,/^@include common-auth/s//auth       required   pam_wheel.so group=sudo\n&/' "${PAM_SU}"
+        error "Ошибка в сгенерированном sshd_config — текущая конфигурация не тронута"
     fi
-    if grep -qE '^\s*auth\s+required\s+pam_wheel\.so.*group=sudo' "${PAM_SU}"; then
+
+    local eff ports
+    eff=$(sshd -T 2>/dev/null || true)
+    ports=$(awk '$1=="port"{print $2}' <<< "${eff}" | sort -u | tr '\n' ' ')
+    [[ "${ports}" == "${SSH_PORT} " ]] || warn "sshd слушает порты: ${ports}— ожидался только ${SSH_PORT}"
+    grep -qx "passwordauthentication no" <<< "${eff}" \
+        || error "PasswordAuthentication не выключен в итоговой конфигурации sshd"
+
+    # UFW уже включён (бывает в образах провайдеров) — открываем порт ДО рестарта
+    local ufw_state; ufw_state=$(ufw status 2>/dev/null || true)
+    if grep -q "^Status: active" <<< "${ufw_state}"; then
+        ufw limit "${SSH_PORT}/tcp" comment "SSH rate-limited" >/dev/null
+        info "UFW активен — порт ${SSH_PORT}/tcp открыт заранее"
+    fi
+
+    # Ubuntu 22.10+: socket-активация, при ней Port в sshd_config игнорируется
+    if systemctl is-enabled ssh.socket &>/dev/null; then
+        warn "Обнаружена socket-активация SSH (ssh.socket) — отключаем"
+        systemctl disable --now ssh.socket
+        track_action unit-enable ssh.socket
+        systemctl enable ssh.service &>/dev/null || true
+        systemctl daemon-reload
+    fi
+
+    local svc="ssh"
+    systemctl cat ssh.service &>/dev/null || svc="sshd"
+    systemctl restart "${svc}"
+    systemctl is-active --quiet "${svc}" || error "SSH не запустился! journalctl -xe -u ${svc}"
+    sleep 1
+    if [[ -n "$(ss -Htln "sport = :${SSH_PORT}" 2>/dev/null)" ]]; then
+        info "SSH (${svc}) слушает порт ${SSH_PORT}"
+    else
+        warn "Порт ${SSH_PORT} не найден в ss — journalctl -xe -u ${svc}"
+    fi
+    APPLIED_SSH_PORT="${SSH_PORT}"
+    save_state
+    SSH_CHECKPOINT_DONE="yes"
+    STEP_NOTE[ssh]="порт ${SSH_PORT}, только ключи, PQ-KEX"
+    # Проверка входа — ДО блокировки root
+    login_checkpoint
+}
+
+# ── 5. root ──────────────────────────────────────────────────────────────────
+step_root() {
+    [[ "${SSH_CHECKPOINT_DONE}" == "yes" ]] || login_checkpoint
+    passwd -l root >/dev/null
+    info "Пароль root заблокирован (откат: passwd root — задать новый пароль)"
+
+    # su — только для группы sudo. В Ubuntu строка закомментирована как
+    # "# auth       required   pam_wheel.so"; без group=sudo проверялась бы группа root
+    local pam_su=/etc/pam.d/su
+    [[ -f "${pam_su}" ]] || return 0
+    track "${pam_su}"
+    if grep -qE '^\s*auth\s+required\s+pam_wheel\.so' "${pam_su}"; then
+        grep -qE '^\s*auth\s+required\s+pam_wheel\.so.*group=sudo' "${pam_su}" \
+            || sed -i -E 's/^(\s*auth\s+required\s+pam_wheel\.so)(.*)$/\1\2 group=sudo/' "${pam_su}"
+    elif grep -qE '^#\s*auth\s+required\s+pam_wheel\.so\s*$' "${pam_su}"; then
+        sed -i -E 's/^#\s*auth\s+required\s+pam_wheel\.so\s*$/auth       required   pam_wheel.so group=sudo/' "${pam_su}"
+    else
+        sed -i '0,/^@include common-auth/s//auth       required   pam_wheel.so group=sudo\n&/' "${pam_su}"
+    fi
+    if grep -qE '^\s*auth\s+required\s+pam_wheel\.so.*group=sudo' "${pam_su}"; then
         info "su ограничен группой sudo"
     else
-        warn "Не удалось включить pam_wheel в ${PAM_SU} — проверьте вручную"
+        warn "Не удалось включить pam_wheel в ${pam_su} — проверьте вручную"
     fi
-fi
+}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 6. Firewall UFW
-#    VPS-специфика: многие провайдеры (Hetzner, DO, Vultr) имеют свой
-#    firewall поверх — дублируйте правила и там для защиты в глубину
-# ──────────────────────────────────────────────────────────────────────────────
-section "6. UFW — брандмауэр"
+# ── 6. UFW ───────────────────────────────────────────────────────────────────
+docker_ufw_rules() {
+    cat << 'EOF'
 
-# ИСПРАВЛЕНО: раньше ufw --force reset молча закрывал порты уже работающих
-# сервисов (веб-сервер и т.п.). Показываем, что слушается, и даём открыть.
-echo ""
-echo "  Сейчас на сервере слушаются порты:"
-ss -tlnp 2>/dev/null | awk 'NR>1 {print "    " $4 "  " $NF}' | sort -u || true
-echo ""
-echo "  Слушающие UDP-порты:"
-ss -ulnp 2>/dev/null | awk 'NR>1 {print "    " $4 "  " $NF}' | sort -u || true
-echo ""
-echo "  UFW закроет ВСЁ входящее, кроме SSH:${SSH_PORT}."
-echo "  Если нужны другие порты — перечислите через пробел."
-echo "  Формат: 80 443 (TCP)  или  443/udp 51820/udp  или  8000:8100/tcp"
-echo "  (Enter — открыть только SSH)"
-read -r -p "  Дополнительные порты: " EXTRA_PORTS
+# BEGIN UBUNTU_HARDENING DOCKER-USER
+# Docker публикует порты через собственные цепочки iptables, минуя правила UFW.
+# Новые входящие соединения из внешней сети к контейнерам блокируются здесь;
+# открыть порт контейнера: ufw route allow proto tcp from any to any port <порт>
+*filter
+:ufw-user-forward - [0:0]
+:ufw-docker-logging-deny - [0:0]
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -j ufw-user-forward
+-A DOCKER-USER -j RETURN -s 10.0.0.0/8
+-A DOCKER-USER -j RETURN -s 172.16.0.0/12
+-A DOCKER-USER -j RETURN -s 192.168.0.0/16
+-A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
+-A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 10.0.0.0/8
+-A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 172.16.0.0/12
+-A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 192.168.0.0/16
+-A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 10.0.0.0/8
+-A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 172.16.0.0/12
+-A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 192.168.0.0/16
+-A DOCKER-USER -j RETURN
+-A ufw-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
+-A ufw-docker-logging-deny -j DROP
+COMMIT
+# END UBUNTU_HARDENING DOCKER-USER
+EOF
+}
 
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw default deny forward
-
-# limit = встроенный rate-limit UFW: 6 попыток за 30 сек -> блок
-ufw limit "${SSH_PORT}/tcp" comment "SSH rate-limited"
-
-if [[ -n "${EXTRA_PORTS:-}" ]]; then
-    for p in ${EXTRA_PORTS}; do
-        if [[ "${p}" =~ ^([0-9]+)(:([0-9]+))?(/(tcp|udp))?$ ]] \
-           && (( BASH_REMATCH[1] >= 1 && BASH_REMATCH[1] <= 65535 )) \
-           && (( ${BASH_REMATCH[3]:-1} >= 1 && ${BASH_REMATCH[3]:-1} <= 65535 )); then
-            _rule="${p}"
-            # диапазон требует явного протокола; одиночный порт без него — TCP
-            [[ "${p}" == */* ]] || _rule="${p}/tcp"
-            ufw allow "${_rule}" comment "user-defined" || { warn "UFW отклонил правило ${_rule}"; continue; }
-            info "UFW: открыт ${_rule}"
-        else
-            warn "Некорректный порт '${p}' — пропущен"
-        fi
+step_ufw() {
+    ensure_pkgs ufw
+    local f
+    for f in /etc/ufw/user.rules /etc/ufw/user6.rules /etc/ufw/before.rules /etc/ufw/before6.rules \
+             /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/ufw.conf /etc/default/ufw; do
+        track "$f"
     done
-fi
+    ufw --force reset >/dev/null
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw default deny routed
 
-ufw --force enable
-ufw status verbose
-info "UFW включён: входящий трафик запрещён кроме SSH:${SSH_PORT}${EXTRA_PORTS:+ и ${EXTRA_PORTS}}"
+    # limit = встроенный rate-limit UFW: 6 попыток за 30 секунд -> блок
+    ufw limit "${SSH_PORT}/tcp" comment "SSH rate-limited"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 7. Fail2ban
-# ──────────────────────────────────────────────────────────────────────────────
-section "7. Fail2ban"
+    local p rule
+    for p in ${EXTRA_PORTS}; do
+        rule="${p}"; [[ "${p}" == */* ]] || rule="${p}/tcp"
+        if ufw allow "${rule}" comment "user-defined" >/dev/null; then info "UFW: открыт ${rule}"
+        else warn "UFW отклонил правило ${rule}"; fi
+    done
 
-cat > /etc/fail2ban/jail.local << EOF
+    if docker_fix_active; then
+        if ! grep -q "BEGIN UBUNTU_HARDENING DOCKER-USER" /etc/ufw/after.rules; then
+            docker_ufw_rules >> /etc/ufw/after.rules
+        fi
+        info "Docker: опубликованные порты закрыты извне (цепочка DOCKER-USER)"
+        local port proto
+        for p in ${DOCKER_ALLOW_PORTS}; do
+            port="${p%/*}"; proto="tcp"; [[ "${p}" == */* ]] && proto="${p#*/}"
+            if ufw route allow proto "${proto}" from any to any port "${port//-/:}" comment "docker" >/dev/null; then
+                info "UFW: открыт порт контейнера ${port}/${proto}"
+            else
+                warn "UFW отклонил правило для порта контейнера ${p}"
+            fi
+        done
+        STEP_NOTE[ufw]="Docker закрыт DOCKER-USER${DOCKER_ALLOW_PORTS:+, открыто: ${DOCKER_ALLOW_PORTS}}"
+    elif has_docker; then
+        warn "Docker найден, DOCKER_UFW_FIX=no: опубликованные порты контейнеров доступны в обход UFW"
+    fi
+
+    ufw --force enable
+    ufw status verbose
+}
+
+# ── 7. Fail2ban ──────────────────────────────────────────────────────────────
+step_fail2ban() {
+    ensure_pkgs fail2ban
+    write_file /etc/fail2ban/jail.local 644 << EOF
+# ubuntu_hardening.sh
 [DEFAULT]
 bantime   = 1h
 findtime  = 10m
 maxretry  = 3
 backend   = systemd
 banaction = ufw
-# Свои адреса не баним; добавьте сюда IP своего офиса/VPN через пробел
-ignoreip  = 127.0.0.1/8 ::1
+# Свои адреса (офис, VPN) задаются FAIL2BAN_IGNOREIP
+ignoreip  = 127.0.0.1/8 ::1 ${FAIL2BAN_IGNOREIP}
 
 [sshd]
 enabled  = true
@@ -2907,381 +3309,348 @@ bantime  = 1w
 findtime = 1d
 maxretry = 3
 EOF
-
-systemctl enable --now fail2ban
-info "Fail2ban: 3 неудачных попытки -> бан 24 часа"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 8. Cron hardening
-# ──────────────────────────────────────────────────────────────────────────────
-section "8. Защита планировщика cron"
-
-for path in /etc/crontab \
-            /etc/cron.hourly/ /etc/cron.daily/ \
-            /etc/cron.weekly/ /etc/cron.monthly/ \
-            /etc/cron.d/; do
-    [[ -e "$path" ]] || continue
-    chown root:root "$path"
-    chmod og-rwx   "$path"
-done
-
-echo "root" > /etc/cron.allow && chmod 600 /etc/cron.allow
-[[ -f /etc/cron.deny ]] && rm /etc/cron.deny
-
-if command -v at &>/dev/null; then
-    echo "root" > /etc/at.allow && chmod 600 /etc/at.allow
-    [[ -f /etc/at.deny ]] && rm /etc/at.deny
-fi
-
-info "cron/at: доступ разрешён только root"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 9. Защита разделов (fstab)
-# ──────────────────────────────────────────────────────────────────────────────
-section "9. Защита разделов (/tmp, /dev/shm, /var/tmp, /home)"
-
-FSTAB="/etc/fstab"
-cp "${FSTAB}" "${FSTAB}.bak.$(date +%Y%m%d%H%M%S)"
-
-# Заменяет запись с точкой монтирования $1 (поле 2) на $2; комментарии не трогает.
-# (v2 удаляла по подстроке — это было хрупко)
-fstab_set() {
-    local mountpoint="$1"
-    local entry="$2"
-    awk -v mp="${mountpoint}" '/^[[:space:]]*#/ || $2 != mp' "${FSTAB}" > "${FSTAB}.tmp"
-    echo "${entry}" >> "${FSTAB}.tmp"
-    mv "${FSTAB}.tmp" "${FSTAB}"
-    info "fstab: ${mountpoint} настроен"
+    systemctl enable fail2ban &>/dev/null || true
+    systemctl restart fail2ban || warn "fail2ban не перезапустился: journalctl -u fail2ban"
+    info "Fail2ban: 3 неудачные попытки -> бан 24 ч, повторно -> неделя"
 }
 
-# /tmp в RAM — с ограничением размера: без size= tmpfs может занять до 50% RAM,
-# и любой пользователь, заполнив /tmp, выдавит из памяти сервисы
-TMP_SIZE_MB=$(( TOTAL_RAM_KB / 1024 / 4 ))
-(( TMP_SIZE_MB < 256  )) && TMP_SIZE_MB=256
-(( TMP_SIZE_MB > 2048 )) && TMP_SIZE_MB=2048
-fstab_set "/tmp" \
-    "tmpfs /tmp tmpfs rw,nosuid,nodev,noexec,relatime,mode=1777,size=${TMP_SIZE_MB}m 0 0"
-info "  /tmp: tmpfs ${TMP_SIZE_MB} МБ"
+# ── 8. cron/at ───────────────────────────────────────────────────────────────
+step_cron() {
+    local path
+    for path in /etc/crontab /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /etc/cron.d; do
+        [[ -e "${path}" ]] || continue
+        chown root:root "${path}"
+        chmod og-rwx "${path}"
+    done
+    track /etc/cron.allow /etc/cron.deny
+    echo "root" > /etc/cron.allow; chmod 600 /etc/cron.allow
+    rm -f /etc/cron.deny
+    if command -v at &>/dev/null; then
+        track /etc/at.allow /etc/at.deny
+        echo "root" > /etc/at.allow; chmod 600 /etc/at.allow
+        rm -f /etc/at.deny
+    fi
+    info "cron/at: доступ только у root (своим пользователям — допишите в /etc/cron.allow)"
+}
 
-# /dev/shm  (seclabel убрана — только для SELinux, Ubuntu использует AppArmor)
-fstab_set "/dev/shm" \
-    "tmpfs /dev/shm tmpfs defaults,noexec,nodev,nosuid 0 0"
+# ── 9. Разделы ───────────────────────────────────────────────────────────────
+step_mounts() {
+    local mode="${TMP_MODE}"
+    if [[ "${mode}" == "auto" ]]; then
+        if (( TOTAL_RAM_KB >= 2 * 1024 * 1024 )); then mode="tmpfs"; else mode="disk"; fi
+    fi
+    if [[ "${mode}" == "tmpfs" ]]; then
+        # без size= tmpfs может занять до 50% RAM
+        local size=$(( TOTAL_RAM_KB / 1024 / 4 ))
+        (( size < 256 ))  && size=256
+        (( size > 2048 )) && size=2048
+        fstab_set /tmp "tmpfs /tmp tmpfs rw,nosuid,nodev,noexec,relatime,mode=1777,size=${size}m 0 0"
+        STEP_NOTE[mounts]="/tmp: tmpfs ${size} МБ"
+    else
+        # мало RAM: /tmp остаётся на диске, флаги — через bind на себя
+        fstab_set /tmp "/tmp /tmp none bind,nosuid,nodev,noexec 0 0"
+        STEP_NOTE[mounts]="/tmp: на диске (RAM < 2 ГБ или TMP_MODE=disk)"
+    fi
+    fstab_set /dev/shm "tmpfs /dev/shm tmpfs defaults,noexec,nodev,nosuid 0 0"
+    # /var/tmp по FHS переживает перезагрузку — bind на себя
+    fstab_set /var/tmp "/var/tmp /var/tmp none bind,nosuid,nodev,noexec 0 0"
 
-# ИСПРАВЛЕНО: v2 привязывала /var/tmp к tmpfs /tmp, и он очищался при каждой
-# перезагрузке — а /var/tmp по FHS обязан переживать reboot (на это рассчитывают
-# systemd, редакторы, установщики). Теперь /var/tmp привязан сам к себе с теми
-# же защитными флагами. Старая запись "/tmp /var/tmp none bind" заменяется.
-fstab_set "/var/tmp" \
-    "/var/tmp /var/tmp none bind,nosuid,nodev,noexec 0 0"
+    local cur_tmp; cur_tmp=$(findmnt -no FSTYPE /tmp 2>/dev/null || true)
+    if [[ "${mode}" == "tmpfs" && "${cur_tmp}" == "tmpfs" ]] || [[ "${mode}" == "disk" && -n "${cur_tmp}" && "${cur_tmp}" != "tmpfs" ]]; then
+        mount -o remount /tmp 2>/dev/null && info "  /tmp перемонтирован" || warn "/tmp: применится после reboot"
+    elif [[ -z "${cur_tmp}" ]] && mount /tmp 2>/dev/null; then
+        info "  /tmp смонтирован"
+    else
+        warn "/tmp: тип монтирования меняется — применится после reboot"
+    fi
+    mount -o remount /dev/shm 2>/dev/null && info "  /dev/shm перемонтирован" || warn "/dev/shm: применится после reboot"
+    if mountpoint -q /var/tmp; then
+        mount -o remount,bind,nosuid,nodev,noexec /var/tmp 2>/dev/null || warn "/var/tmp: применится после reboot"
+    elif mount /var/tmp 2>/dev/null; then
+        info "  /var/tmp смонтирован (bind, noexec)"
+    else
+        warn "/var/tmp: применится после reboot"
+    fi
 
-# Применяем без перезагрузки
-mount -o remount /tmp     2>/dev/null && info "  /tmp перемонтирован"     || warn "/tmp: применится после reboot"
-mount -o remount /dev/shm 2>/dev/null && info "  /dev/shm перемонтирован" || warn "/dev/shm: применится после reboot"
-if mountpoint -q /var/tmp; then
-    warn "/var/tmp уже смонтирован (возможно, старый bind на /tmp) — новая схема после reboot"
-elif mount /var/tmp 2>/dev/null; then
-    info "  /var/tmp смонтирован (bind на себя, noexec)"
-else
-    warn "/var/tmp: применится после reboot"
-fi
-
-# ФИКС noexec /tmp для apt: часть maintainer-скриптов dpkg выполняется
-# из временного каталога — переносим его, иначе ночные unattended-upgrades
-# могут падать с Permission denied
-mkdir -p /var/lib/apt/tmp
-cat > /etc/apt/apt.conf.d/99tempdir << 'EOF'
+    # noexec /tmp ломает часть maintainer-скриптов dpkg — свой каталог для apt
+    mkdir -p /var/lib/apt/tmp
+    write_file /etc/apt/apt.conf.d/99tempdir 644 << 'EOF'
 // /tmp смонтирован с noexec — apt использует отдельный каталог
 APT::ExtractTemplates::TempDir "/var/lib/apt/tmp";
 EOF
-info "apt: временный каталог перенесён в /var/lib/apt/tmp (совместимость с noexec /tmp)"
 
-# /home — на VPS чаще не отдельный раздел.
-# ВНИМАНИЕ: noexec на /home запрещает запуск ~/bin, ~/.local/bin и т.п.
-if awk '!/^[[:space:]]*#/ && $2=="/home" && $3!="none"' "${FSTAB}" | grep -q .; then
-    # Отдельный раздел: добавляем недостающие опции (повторный запуск не дублирует)
-    awk 'BEGIN{OFS="\t"}
-         !/^[[:space:]]*#/ && $2=="/home" {
-             n=split("nosuid,nodev,noexec", add, ",")
-             for (i=1; i<=n; i++) if ($4 !~ "(^|,)" add[i] "(,|$)") $4=$4 "," add[i]
-         } {print}' "${FSTAB}" > "${FSTAB}.tmp" && mv "${FSTAB}.tmp" "${FSTAB}"
-    mount -o remount /home 2>/dev/null || warn "/home: применится после reboot"
-    info "fstab: /home защищён (отдельный раздел)"
-else
-    # ИСПРАВЛЕНО: v2 ставила remount-home.service с "mount -o remount /home",
-    # но /home не точка монтирования — команда падала при каждой загрузке.
-    # Правильно: bind-монтирование каталога на себя с нужными флагами.
-    if [[ -f /etc/systemd/system/remount-home.service ]]; then
-        systemctl disable remount-home.service 2>/dev/null || true
-        rm -f /etc/systemd/system/remount-home.service
-        info "Удалён неработающий remount-home.service (v2)"
-    fi
-    fstab_set "/home" "/home /home none bind,nosuid,nodev,noexec 0 0"
-    systemctl daemon-reload
-    if mountpoint -q /home; then
-        mount -o remount,bind,nosuid,nodev,noexec /home 2>/dev/null \
-            || warn "/home: применится после reboot"
-    elif mount /home 2>/dev/null; then
-        info "  /home смонтирован (bind на себя, noexec,nosuid,nodev)"
+    # /home
+    local hopts="nosuid,nodev"
+    [[ "${HOME_NOEXEC}" == "yes" ]] && hopts+=",noexec"
+    if awk '!/^[[:space:]]*#/ && $2=="/home" && $3!="none"' /etc/fstab | grep -q .; then
+        track /etc/fstab
+        local tmp; make_tmp tmp /etc
+        awk -v add="${hopts}" 'BEGIN{OFS="\t"}
+             !/^[[:space:]]*#/ && $2=="/home" {
+                 n = split(add, a, ",")
+                 for (i = 1; i <= n; i++) if ($4 !~ "(^|,)" a[i] "(,|$)") $4 = $4 "," a[i]
+             } {print}' /etc/fstab > "${tmp}"
+        chmod 644 "${tmp}"; mv "${tmp}" /etc/fstab
+        mount -o remount /home 2>/dev/null || warn "/home: применится после reboot"
+        info "fstab: /home (отдельный раздел): ${hopts}"
     else
-        warn "/home: применится после reboot"
+        if [[ -f /etc/systemd/system/remount-home.service ]]; then
+            systemctl disable remount-home.service &>/dev/null || true
+            track /etc/systemd/system/remount-home.service
+            rm -f /etc/systemd/system/remount-home.service
+            info "Удалён неработающий remount-home.service (v2)"
+        fi
+        fstab_set /home "/home /home none bind,${hopts} 0 0"
+        systemctl daemon-reload
+        if mountpoint -q /home; then
+            mount -o "remount,bind,${hopts}" /home 2>/dev/null || warn "/home: применится после reboot"
+        elif mount /home 2>/dev/null; then
+            info "  /home смонтирован (bind, ${hopts})"
+        else
+            warn "/home: применится после reboot"
+        fi
     fi
-fi
+    [[ "${HOME_NOEXEC}" == "yes" ]] && info "  /home: noexec (~/.local/bin, VS Code Remote, nvm не запустятся; HOME_NOEXEC=no)"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 10. Kernel / sysctl hardening
-# ──────────────────────────────────────────────────────────────────────────────
-section "10. Параметры ядра (sysctl)"
+    if [[ "${HIDEPID}" == "yes" ]]; then
+        getent group proc &>/dev/null || groupadd -r proc
+        fstab_set /proc "proc /proc proc defaults,hidepid=invisible,gid=proc 0 0"
+        write_file /etc/systemd/system/systemd-logind.service.d/hidepid.conf 644 << 'EOF'
+[Service]
+SupplementaryGroups=proc
+EOF
+        id polkitd &>/dev/null && usermod -aG proc polkitd
+        systemctl daemon-reload
+        warn "hidepid применится после reboot; мониторинг, которому нужны все процессы, добавьте в группу proc"
+    fi
+}
 
-# rp_filter: строгий режим (1) ломает асимметричную маршрутизацию — типичный
-# случай VPS с публичным интерфейсом и приватной сетью провайдера.
-# Несколько интерфейсов -> свободный режим (2): защита от спуфинга остаётся.
-IFACE_COUNT=$(ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2}' \
-              | grep -cvE '^(docker|br-|veth|virbr|tun|tap|wg)' || true)
-RP_FILTER=1
-(( IFACE_COUNT > 1 )) && RP_FILTER=2
-info "Сетевых интерфейсов: ${IFACE_COUNT} -> rp_filter=${RP_FILTER}"
+# ── 10. sysctl ───────────────────────────────────────────────────────────────
+step_sysctl() {
+    # rp_filter: строгий режим (1) ломает асимметричную маршрутизацию (публичная
+    # + приватная сеть провайдера). Несколько интерфейсов -> свободный режим (2)
+    local ifaces count rp=1
+    ifaces=$(ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2}' || true)
+    count=$(grep -cvE '^(docker|br-|veth|virbr|tun|tap|wg|lxdbr|cni|flannel)' <<< "${ifaces}" || true)
+    (( count > 1 )) && rp=2
+    info "Сетевых интерфейсов: ${count} -> rp_filter=${rp}"
 
-cat > /etc/sysctl.d/99-hardening.conf << EOF
+    local fwd="${IP_FORWARD}"
+    if [[ "${fwd}" == "auto" ]]; then
+        if needs_ip_forward; then fwd="yes"; else fwd="no"; fi
+    fi
+    [[ "${fwd}" == "yes" ]] && info "IP-форвардинг включён (Docker/Podman/LXD/WireGuard или IP_FORWARD=yes)"
+
+    local ra="${IPV6_ACCEPT_RA}" v6
+    if [[ "${ra}" == "auto" ]]; then
+        v6=$(ip -6 addr show scope global 2>/dev/null || true)
+        if [[ -n "${v6}" ]]; then ra="yes"; else ra="no"; fi
+    fi
+
+    local f=/etc/sysctl.d/99-hardening.conf
+    track "$f"
+    {
+        cat << EOF
+# ubuntu_hardening.sh v${SCRIPT_VERSION}
 # ============================================================
-#  Сетевая безопасность
+#  Сеть
 # ============================================================
+# Анти-спуфинг: 1 = строго, 2 = свободно (несколько интерфейсов)
+net.ipv4.conf.all.rp_filter = ${rp}
+net.ipv4.conf.default.rp_filter = ${rp}
 
-# Обратная проверка пути (анти-спуфинг): 1 = строго, 2 = свободно (multi-NIC)
-net.ipv4.conf.all.rp_filter = ${RP_FILTER}
-net.ipv4.conf.default.rp_filter = ${RP_FILTER}
-
-# Не принимать пакеты с маршрутом источника
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_source_route = 0
 
-# VPS — не роутер, отключить форвардинг
-net.ipv4.ip_forward = 0
-net.ipv6.conf.all.forwarding = 0
+EOF
+        if [[ "${fwd}" == "yes" ]]; then
+            echo "# Форвардинг нужен контейнерам/VPN (IP_FORWARD=${IP_FORWARD})"
+            echo "net.ipv4.ip_forward = 1"
+        else
+            echo "# Сервер — не маршрутизатор"
+            echo "net.ipv4.ip_forward = 0"
+            echo "net.ipv6.conf.all.forwarding = 0"
+        fi
+        cat << 'EOF'
 
-# Защита от SYN-flood
+# SYN-flood
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_max_syn_backlog = 4096
 
-# Не принимать ICMP-редиректы (MITM)
+# ICMP-редиректы (MITM)
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
-
-# Не отправлять редиректы
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 
-# Игнорировать broadcast ping (Smurf)
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
-
-# Логировать martian-пакеты (подозрительные источники)
-net.ipv4.conf.all.log_martians = 1
-net.ipv4.conf.default.log_martians = 1
-
-# IPv6: отключить RA если IPv6 не нужен
-net.ipv6.conf.all.accept_ra = 0
-net.ipv6.conf.default.accept_ra = 0
-
-# Защита от TIME-WAIT атак (RFC 1337)
 net.ipv4.tcp_rfc1337 = 1
+EOF
+        if [[ "${LOG_MARTIANS}" == "yes" ]]; then
+            echo ""
+            echo "net.ipv4.conf.all.log_martians = 1"
+            echo "net.ipv4.conf.default.log_martians = 1"
+        fi
+        echo ""
+        if [[ "${ra}" == "no" ]]; then
+            echo "# Глобального IPv6 нет (или IPV6_ACCEPT_RA=no) — RA не принимаем"
+            echo "net.ipv6.conf.all.accept_ra = 0"
+            echo "net.ipv6.conf.default.accept_ra = 0"
+        else
+            echo "# accept_ra не меняется: у сервера есть глобальный IPv6 (маршрут по умолчанию из RA)"
+        fi
+        cat << 'EOF'
 
 # ============================================================
-#  Безопасность ядра
+#  Ядро
 # ============================================================
-
-# ptrace (Yama): 1 = только родительский процесс может трассировать
-# (не 2, чтобы не сломать strace/gdb при отладке на VPS)
+# ptrace: только родитель (2 ломает strace/gdb)
 kernel.yama.ptrace_scope = 1
-
-# Запретить чтение dmesg обычным пользователям
 kernel.dmesg_restrict = 1
-
-# Скрыть адреса ядра из /proc и /sys
 kernel.kptr_restrict = 2
-
-# Отключить SysRq (на VPS есть консоль провайдера)
 kernel.sysrq = 0
-
-# ASLR: максимальная рандомизация адресного пространства
 kernel.randomize_va_space = 2
 
-# Core dump: запретить
 fs.suid_dumpable = 0
 kernel.core_uses_pid = 1
 kernel.core_pattern = |/bin/false
 
-# Защита symlink/hardlink (/tmp-атаки)
 fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
 fs.protected_fifos = 2
 fs.protected_regular = 2
 
-# Запрет kexec: нельзя подменить ядро без перезагрузки (необратимо до reboot)
+# Запрет kexec (необратимо до reboot)
 kernel.kexec_load_disabled = 1
-
-# eBPF: только для root + усиление JIT (меньше поверхность для эксплойтов ядра)
 kernel.unprivileged_bpf_disabled = 1
 net.core.bpf_jit_harden = 2
-
-# Не подгружать TTY line discipline по запросу пользователя (класс CVE в n_hdlc и др.)
 dev.tty.ldisc_autoload = 0
-
-# userfaultfd только для привилегированных (используется в эксплойтах гонок)
 vm.unprivileged_userfaultfd = 0
 EOF
+        # Ядра Ubuntu поддерживают perf_event_paranoid=4 и обычно уже так настроены —
+        # повышаем только если текущее значение ниже 3
+        local pep; pep=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 4)
+        if (( pep < 3 )); then echo "kernel.perf_event_paranoid = 3"; fi
 
-# ── User namespaces: параметр зависит от ядра ─────────────────────────────────
-# kernel.unprivileged_userns_clone — Debian/Ubuntu-патч, отсутствует на новых
-# ядрах (24.04+/26.04). Там вместо него apparmor_restrict_unprivileged_userns.
-# Пишем только те параметры, которые реально существуют в ядре.
-{
-    echo ""
-    echo "# ============================================================"
-    echo "#  Ограничение user namespaces (подобрано под текущее ядро)"
-    echo "#  Отключите/закомментируйте если используете rootless Docker/Podman"
-    echo "# ============================================================"
-    if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
-        echo "kernel.unprivileged_userns_clone = 0"
+        echo ""
+        echo "# User namespaces (rootless Docker/Podman потребуют отключить)"
+        [[ -f /proc/sys/kernel/unprivileged_userns_clone ]] && echo "kernel.unprivileged_userns_clone = 0"
+        [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] && echo "kernel.apparmor_restrict_unprivileged_userns = 1"
+        true
+    } > "$f"
+
+    sysctl --system -q || warn "sysctl: часть параметров не применилась (см. вывод выше)"
+    STEP_NOTE[sysctl]="rp_filter=${rp}, forward=${fwd}, accept_ra=${ra}"
+}
+
+# ── 11. Модули ядра и параметры загрузки ─────────────────────────────────────
+step_modules() {
+    local mods=(cramfs freevxfs jffs2 hfs hfsplus udf
+                dccp sctp rds tipc
+                ax25 netrom rose x25 appletalk ipx can atm n_hdlc)
+    # squashfs нужен snap — блокируем только без snapd
+    if ! command -v snap &>/dev/null && ! dpkg -s snapd &>/dev/null; then mods+=(squashfs); fi
+
+    local f=/etc/modprobe.d/hardening-blacklist.conf m
+    track "$f"
+    mkdir -p /etc/modprobe.d
+    {
+        echo "# ubuntu_hardening.sh: редкие ФС и сетевые протоколы с историей CVE"
+        echo "# (USB/Firewire не трогаем: на VPS их нет; virtio не трогаем)"
+        for m in "${mods[@]}"; do echo "blacklist ${m}"; echo "install ${m} /bin/false"; done
+    } > "$f"
+    for m in "${mods[@]}"; do
+        if [[ -d "/sys/module/${m}" ]]; then
+            modprobe -r "${m}" 2>/dev/null && info "Выгружен модуль ${m}" \
+                || warn "Модуль ${m} загружен и не выгружается — после reboot"
+        fi
+    done
+    local out
+    if ! out=$(luks_regen_initramfs "" 2>&1); then
+        warn "Пересборка initramfs не удалась:"; tail -5 <<< "${out}"
     fi
-    if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
-        echo "kernel.apparmor_restrict_unprivileged_userns = 1"
-    fi
-} >> /etc/sysctl.d/99-hardening.conf
+    info "Blacklist: ${#mods[@]} модулей"
 
-sysctl --system -q || warn "sysctl: часть параметров не применилась (например, IPv6 отключён) — см. вывод выше"
-info "Параметры ядра применены"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 11. Blacklist модулей ядра
-#     VPS-специфика: USB/Firewire убраны — на виртуалке их нет,
-#     а блокировка некоторых virtio-драйверов может сломать систему.
-# ──────────────────────────────────────────────────────────────────────────────
-section "11. Blacklist опасных модулей ядра"
-
-cat > /etc/modprobe.d/hardening-blacklist.conf << 'EOF'
-# Редко используемые файловые системы (вектор атаки через autoMount)
-blacklist cramfs
-blacklist freevxfs
-blacklist jffs2
-blacklist hfs
-blacklist hfsplus
-blacklist udf
-install cramfs   /bin/false
-install freevxfs /bin/false
-install jffs2    /bin/false
-install hfs      /bin/false
-install hfsplus  /bin/false
-install udf      /bin/false
-
-# Устаревшие сетевые протоколы с историей CVE
-blacklist dccp
-blacklist sctp
-blacklist rds
-blacklist tipc
-install dccp /bin/false
-install sctp /bin/false
-install rds  /bin/false
-install tipc /bin/false
+    if [[ "${KERNEL_CMDLINE_HARDENING}" == "yes" ]]; then
+        if command -v update-grub &>/dev/null; then
+            write_file /etc/default/grub.d/99-ubuntu-hardening.cfg 644 << 'EOF'
+# ubuntu_hardening.sh: усиление ядра на этапе загрузки
+GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT} slab_nomerge init_on_alloc=1 page_alloc.shuffle=1 vsyscall=none"
 EOF
+            update-grub &>/dev/null && info "Параметры ядра добавлены в GRUB (после reboot)" \
+                || warn "update-grub не выполнился"
+        else
+            warn "GRUB не найден — параметры загрузки ядра не изменены"
+        fi
+    fi
+}
 
-update-initramfs -u -k all 2>/dev/null || true
-info "Blacklist модулей применён (полная сила — после reboot)"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 12. Core dump — отключение
-# ──────────────────────────────────────────────────────────────────────────────
-section "12. Отключение core dump"
-
-grep -q "hard core" /etc/security/limits.conf || \
-cat >> /etc/security/limits.conf << 'EOF'
+# ── 12. Core dump ────────────────────────────────────────────────────────────
+step_coredump() {
+    # v3 дописывала строки в limits.conf при каждом запуске — убираем их
+    local lc=/etc/security/limits.conf
+    if grep -qE '^(\*|root)[[:space:]]+(hard|soft)[[:space:]]+core[[:space:]]+0[[:space:]]*$' "${lc}" 2>/dev/null; then
+        track "${lc}"
+        sed -i -E '/^(\*|root)[[:space:]]+(hard|soft)[[:space:]]+core[[:space:]]+0[[:space:]]*$/d' "${lc}"
+        info "Из limits.conf убраны строки core (теперь — limits.d)"
+    fi
+    write_file /etc/security/limits.d/99-ubuntu-hardening-core.conf 644 << 'EOF'
+# ubuntu_hardening.sh
 *    hard    core    0
 *    soft    core    0
 root hard    core    0
 EOF
-
-mkdir -p /etc/systemd/coredump.conf.d
-cat > /etc/systemd/coredump.conf.d/disable.conf << 'EOF'
+    write_file /etc/systemd/coredump.conf.d/disable.conf 644 << 'EOF'
 [Coredump]
 Storage=none
 ProcessSizeMax=0
 EOF
+    info "Core dump отключён"
+}
 
-info "Core dump отключён"
+# ── 13. auditd ───────────────────────────────────────────────────────────────
+step_auditd() {
+    ensure_pkgs auditd audispd-plugins
+    local immutable="no" st
+    st=$(auditctl -s 2>/dev/null || true)
+    grep -q "enabled 2" <<< "${st}" && immutable="yes"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 13. Auditd
-# ──────────────────────────────────────────────────────────────────────────────
-section "13. Auditd — аудит системных событий"
-
-# Повторный запуск скрипта: если правила уже immutable (-e 2),
-# любая попытка их изменить или перезапустить auditd уронит скрипт.
-if auditctl -s 2>/dev/null | grep -q "enabled 2"; then
-    warn "Правила auditd в режиме immutable (enabled 2) — изменить можно только после reboot"
-    warn "Секция 13 пропущена. Новые правила применятся при следующей загрузке,"
-    warn "если файлы /etc/audit/ уже содержат нужную конфигурацию."
-else
-
-# ── auditd.conf — лимиты хранения, рассчитанные из свободного места ──────────
-# ИСПРАВЛЕНО: убраны dispatcher/disp_qos — удалены в auditd 3.x (Ubuntu 22.04+),
-# audispd больше не существует как отдельный бинарник
-mkdir -p /etc/audit
-cat > /etc/audit/auditd.conf << EOF
-# Сгенерировано ubuntu_hardening.sh
+    write_file /etc/audit/auditd.conf 640 << EOF
+# ubuntu_hardening.sh
 log_file = /var/log/audit/audit.log
 log_format = ENRICHED
 log_group = root
-
-# Ротация: ${AUDIT_NUM_LOGS} файлов по ${AUDIT_MAX_FILE_MB} МБ каждый
-# Итого: ~$(( AUDIT_NUM_LOGS * AUDIT_MAX_FILE_MB )) МБ — не более 10% свободного места
+# Ротация: ${AUDIT_NUM_LOGS} файлов по ${AUDIT_MAX_FILE_MB} МБ (не более 10% свободного места)
 max_log_file = ${AUDIT_MAX_FILE_MB}
 num_logs = ${AUDIT_NUM_LOGS}
 max_log_file_action = ROTATE
-
-# При нехватке места — не падать, а писать в syslog и ротировать
+# При нехватке места — не останавливать систему (VPS без физического доступа)
 space_left = $(( AUDIT_MAX_FILE_MB * 2 ))
 space_left_action = SYSLOG
-admin_space_left = $(( AUDIT_MAX_FILE_MB ))
+admin_space_left = ${AUDIT_MAX_FILE_MB}
 admin_space_left_action = ROTATE
 disk_full_action = ROTATE
 disk_error_action = SYSLOG
-
 name_format = HOSTNAME
-
-# Флаш: каждые 50 записей, асинхронно
 flush = INCREMENTAL_ASYNC
 freq = 50
 EOF
 
-# ── Правила аудита ─────────────────────────────────────────────────────────────
-# ИСПРАВЛЕНО:
-#   - удалены правила на socket/connect: аудит КАЖДОГО сетевого вызова на
-#     сервере генерирует тысячи событий/сек — это и была главная причина
-#     "backlog limit exceeded", увеличение буфера лечило симптом
-#   - net_bind оставлен с фильтром по auid (новые слушающие сокеты — редкое
-#     и действительно интересное событие)
-#   - добавлены arch=b32 правила: без них 32-битные syscalls не аудировались
-#     (классический способ обхода аудита)
-#   - убран --backlog_wait_time 1: значение 1 мс УМЕНЬШАЛО ожидание
-#     и увеличивало потери (комментарий в старой версии был неверным)
-# v3: добавлены время, mount, hostname/сеть, PAM, AppArmor, входы в систему;
-#     b32 для модулей и bind; вместо -w /sbin/insmod (это симлинки, exec
-#     через них не ловится) — наблюдение за самим /usr/bin/kmod.
-#     -i: не прерывать загрузку правил, если какого-то syscall/пути нет
-#     в этой версии ядра или ОС (например, b32 без IA32-эмуляции).
-cat > /etc/audit/rules.d/99-hardening.rules << EOF
--D
+    local home; home=$(admin_home); home="${home:-/home/${ADMIN_USER}}"
+    write_file /etc/audit/rules.d/99-hardening.rules 640 << EOF
+# ubuntu_hardening.sh v${SCRIPT_VERSION}
+# -b, -f и -e вынесены в zz-hardening-finalize.rules: augenrules оставляет
+# ПОСЛЕДНИЕ из них, а audit.rules дистрибутива читается после файлов 99-*
+# -i: не прерывать загрузку, если syscall/пути нет в этой версии ядра
 -i
-# backlog рассчитан из RAM: ${AUDIT_BACKLOG} записей
--b ${AUDIT_BACKLOG}
-# Режим сбоя 1 = писать в syslog (не 2/паника — VPS без физического доступа!)
--f 1
 
 # Идентификация
 -w /etc/passwd    -p wa -k identity
@@ -3291,6 +3660,7 @@ cat > /etc/audit/rules.d/99-hardening.rules << EOF
 -w /etc/security/opasswd -p wa -k identity
 -w /etc/sudoers   -p wa -k sudoers
 -w /etc/sudoers.d/ -p wa -k sudoers
+-w /var/log/sudo.log -p wa -k sudo_log
 
 # PAM и политики входа
 -w /etc/pam.d/        -p wa -k pam
@@ -3300,10 +3670,10 @@ cat > /etc/audit/rules.d/99-hardening.rules << EOF
 # SSH
 -w /etc/ssh/sshd_config          -p wa -k sshd_config
 -w /etc/ssh/sshd_config.d/       -p wa -k sshd_config
--w /home/${ADMIN_USER}/.ssh/     -p wa -k ssh_keys
+-w ${home}/.ssh/     -p wa -k ssh_keys
 -w /root/.ssh/                   -p wa -k ssh_keys
 
-# Входы в систему и сессии
+# Входы и сессии
 -w /var/log/lastlog   -p wa -k logins
 -w /var/log/faillog   -p wa -k logins
 -w /var/run/faillock/ -p wa -k logins
@@ -3320,13 +3690,12 @@ cat > /etc/audit/rules.d/99-hardening.rules << EOF
 -w /etc/cron.weekly/  -p wa -k cron
 -w /var/spool/cron/   -p wa -k cron
 
-# systemd-юниты и автозагрузка (типичное место закрепления)
--w /etc/systemd/system/       -p wa -k systemd
+# Автозагрузка и предзагрузка библиотек
+-w /etc/systemd/system/ -p wa -k systemd
+-w /etc/ld.so.preload   -p wa -k preload
+-w /etc/ld.so.conf.d/   -p wa -k preload
 
--w /etc/ld.so.preload         -p wa -k preload
--w /etc/ld.so.conf.d/         -p wa -k preload
-
-# Изменение времени (auid-фильтр отсекает chronyd, который крутит часы постоянно)
+# Время (auid-фильтр отсекает chronyd)
 -a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -F auid>=1000 -F auid!=unset -k time_change
 -a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime,stime -F auid>=1000 -F auid!=unset -k time_change
 -w /etc/localtime -p wa -k time_change
@@ -3347,11 +3716,17 @@ cat > /etc/audit/rules.d/99-hardening.rules << EOF
 -a always,exit -F arch=b64 -S mount,umount2 -F auid>=1000 -F auid!=unset -k mounts
 -a always,exit -F arch=b32 -S mount,umount,umount2 -F auid>=1000 -F auid!=unset -k mounts
 
-# Управление привилегиями (b64 + b32 — иначе 32-битные вызовы не аудируются)
+# Права и владельцы (b64 + b32 — иначе 32-битные вызовы не аудируются)
 -a always,exit -F arch=b64 -S chmod,fchmod,fchmodat           -F auid>=1000 -F auid!=unset -k file_perm
 -a always,exit -F arch=b32 -S chmod,fchmod,fchmodat           -F auid>=1000 -F auid!=unset -k file_perm
 -a always,exit -F arch=b64 -S chown,fchown,fchownat,lchown    -F auid>=1000 -F auid!=unset -k file_perm
 -a always,exit -F arch=b32 -S chown,fchown,fchownat,lchown    -F auid>=1000 -F auid!=unset -k file_perm
+-a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k file_perm
+-a always,exit -F arch=b32 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k file_perm
+# fchmodat2 (ядро 6.6+) — отдельным правилом: неизвестный syscall отбросил бы всё правило
+-a always,exit -F arch=b64 -S fchmodat2 -F auid>=1000 -F auid!=unset -k file_perm
+
+# Привилегии
 -a always,exit -F arch=b64 -S setuid,setgid,setreuid,setregid -F auid>=1000 -F auid!=unset -k priv_esc
 -a always,exit -F arch=b32 -S setuid,setgid,setreuid,setregid -F auid>=1000 -F auid!=unset -k priv_esc
 -a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -F auid!=unset -k priv_exec
@@ -3360,217 +3735,282 @@ cat > /etc/audit/rules.d/99-hardening.rules << EOF
 # Неудачные попытки доступа к файлам (признак разведки)
 -a always,exit -F arch=b64 -S open,openat,creat,truncate,ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access
 -a always,exit -F arch=b64 -S open,openat,creat,truncate,ftruncate -F exit=-EPERM  -F auid>=1000 -F auid!=unset -k access
+-a always,exit -F arch=b32 -S open,openat,creat,truncate,ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access
+-a always,exit -F arch=b32 -S open,openat,creat,truncate,ftruncate -F exit=-EPERM  -F auid>=1000 -F auid!=unset -k access
+-a always,exit -F arch=b64 -S openat2,open_by_handle_at -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access
+-a always,exit -F arch=b64 -S openat2,open_by_handle_at -F exit=-EPERM  -F auid>=1000 -F auid!=unset -k access
+
+# Удаление и переименование файлов пользователями
+-a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=unset -k delete
+-a always,exit -F arch=b32 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=unset -k delete
+-a always,exit -F arch=b64 -S renameat2 -F auid>=1000 -F auid!=unset -k delete
 
 # Модули ядра
--w /usr/bin/kmod   -p x -k kernel_modules
+-w /usr/bin/kmod -p x -k kernel_modules
 -a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k kernel_modules
 -a always,exit -F arch=b32 -S init_module,finit_module,delete_module -k kernel_modules
 
-# Сеть: только bind реальных пользователей (новый слушающий сокет — редкое
-# и значимое событие). socket/connect НЕ аудируем — источник backlog exceeded.
+# Сеть: только bind реальных пользователей (socket/connect — источник backlog exceeded)
 -a always,exit -F arch=b64 -S bind -F auid>=1000 -F auid!=unset -k net_bind
 -a always,exit -F arch=b32 -S bind -F auid>=1000 -F auid!=unset -k net_bind
 
-# Загрузчик и ядро
+# Загрузчик и kexec
 -w /boot/ -p wa -k boot
 -a always,exit -F arch=b64 -S kexec_load,kexec_file_load -k kexec
+-a always,exit -F arch=b32 -S kexec_load -k kexec
+EOF
 
-# Сделать правила неизменяемыми до перезагрузки
+    # Запуск SUID/SGID-программ (CIS 4.1.3.6) — список строится на этом сервере
+    local bin n=0
+    {
+        echo "# ubuntu_hardening.sh: запуск привилегированных программ, $(date +%F)"
+        while IFS= read -r bin; do
+            echo "-a always,exit -F path=${bin} -F perm=x -F auid>=1000 -F auid!=unset -k privileged"
+        done < <(find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null | sort || true)
+    } | write_file /etc/audit/rules.d/70-privileged.rules 640
+    n=$(grep -c '^-a' /etc/audit/rules.d/70-privileged.rules || true)
+
+    write_file /etc/audit/rules.d/zz-hardening-finalize.rules 640 << EOF
+# ubuntu_hardening.sh — читается последним (ls -v): эти значения побеждают
+# -b 8192 из audit.rules дистрибутива
+-b ${AUDIT_BACKLOG}
+# Режим сбоя 1 = syslog (не 2/паника — VPS без физического доступа)
+-f 1
+# Неизменяемые правила до перезагрузки
 -e 2
 EOF
 
-# ИСПРАВЛЕНО: файл /etc/logrotate.d/audit удалён из скрипта.
-# auditd ротирует логи сам (max_log_file_action = ROTATE); параллельный
-# logrotate с рестартом auditd давал двойную ротацию и разрывы аудита.
-rm -f /etc/logrotate.d/audit
+    # auditd ротирует сам (max_log_file_action = ROTATE)
+    track /etc/logrotate.d/audit
+    rm -f /etc/logrotate.d/audit
+    mkdir -p /var/log/audit
 
-mkdir -p /var/log/audit
-augenrules --load 2>/dev/null || true
-systemctl restart auditd 2>/dev/null || service auditd restart 2>/dev/null || true
-info "auditd настроен: backlog=${AUDIT_BACKLOG}, ${AUDIT_NUM_LOGS}×${AUDIT_MAX_FILE_MB}МБ (≤10% диска)"
-
-fi  # конец проверки immutable
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 14. AppArmor
-# ──────────────────────────────────────────────────────────────────────────────
-section "14. AppArmor"
-
-if ! dpkg -s apparmor-utils &>/dev/null; then
-    apt-get install -y -qq apparmor apparmor-utils
-fi
-
-systemctl enable --now apparmor
-
-# ИСПРАВЛЕНО: v2 переводила в enforce ВСЕ файлы /etc/apparmor.d. Но часть
-# профилей дистрибутив держит в complain или flags=(unconfined) намеренно
-# (на 24.04 — десятки профилей для userns), принудительный enforce ломал
-# эти программы. Теперь — отчёт и, по желанию, enforce для complain-профилей.
-if aa-status --enabled 2>/dev/null; then
-    _aa_enf=$(aa-status --profiled 2>/dev/null || echo "?")
-    _aa_cmp=$(aa-status --complaining 2>/dev/null || echo "?")
-    info "AppArmor активен: профилей загружено ${_aa_enf}, в режиме complain ${_aa_cmp}"
-    if [[ "${APPARMOR_ENFORCE_ALL}" == "yes" ]]; then
-        # Только профили, которые сейчас в complain, и не помеченные unconfined
-        grep -lE 'flags=\([^)]*complain' /etc/apparmor.d/* 2>/dev/null \
-            | xargs -r grep -LE 'flags=\([^)]*unconfined' \
-            | while read -r profile; do
-                  aa-enforce "${profile}" &>/dev/null \
-                      && info "  enforce: $(basename "${profile}")" \
-                      || warn "  не удалось: $(basename "${profile}")"
-              done
-    elif [[ "${_aa_cmp}" != "0" && "${_aa_cmp}" != "?" ]]; then
-        info "  Профили в complain: aa-status | sed -n '/complain mode/,/^[0-9]/p'"
-        info "  Перевести выборочно: aa-enforce /etc/apparmor.d/<профиль>"
+    if [[ "${immutable}" == "yes" ]]; then
+        warn "Правила auditd неизменяемы (enabled 2) — новые файлы записаны и применятся после reboot"
+    else
+        augenrules --load &>/dev/null || warn "augenrules --load завершился с ошибкой — проверьте: augenrules --check"
+        systemctl restart auditd 2>/dev/null || service auditd restart 2>/dev/null \
+            || warn "auditd не перезапустился"
     fi
-else
-    warn "AppArmor не активен (проверьте параметры ядра apparmor=1 security=apparmor)"
-fi
+    STEP_NOTE[auditd]="backlog ${AUDIT_BACKLOG}, ${AUDIT_NUM_LOGS}×${AUDIT_MAX_FILE_MB} МБ, SUID/SGID: ${n}"
+}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 15. sudo hardening
-# ──────────────────────────────────────────────────────────────────────────────
-section "15. Настройка sudo"
+# ── 14. AppArmor ─────────────────────────────────────────────────────────────
+step_apparmor() {
+    ensure_pkgs apparmor apparmor-utils
+    systemctl enable --now apparmor &>/dev/null || true
+    if aa-status --enabled 2>/dev/null; then
+        local enf cmp
+        enf=$(aa-status --profiled 2>/dev/null || echo "?")
+        cmp=$(aa-status --complaining 2>/dev/null || echo "?")
+        info "AppArmor активен: профилей ${enf}, в complain ${cmp}"
+        if [[ "${APPARMOR_ENFORCE_ALL}" == "yes" ]]; then
+            local profile
+            while IFS= read -r profile; do
+                if aa-enforce "${profile}" &>/dev/null; then info "  enforce: $(basename "${profile}")"
+                else warn "  не удалось: $(basename "${profile}")"; fi
+            done < <(grep -lE 'flags=\([^)]*complain' /etc/apparmor.d/* 2>/dev/null \
+                        | xargs -r grep -LE 'flags=\([^)]*unconfined' || true)
+        elif [[ "${cmp}" != "0" && "${cmp}" != "?" ]]; then
+            info "  Перевести выборочно: aa-enforce /etc/apparmor.d/<профиль>"
+        fi
+    else
+        warn "AppArmor не активен (параметры ядра apparmor=1 security=apparmor)"
+    fi
+}
 
-# Ubuntu 25.10+ / 26.04: по умолчанию sudo-rs. Он поддерживает не все Defaults —
-# используем только общие для sudo и sudo-rs.
-if sudo --version 2>/dev/null | head -1 | grep -qi "sudo-rs"; then
-    info "Обнаружен sudo-rs"
-fi
-
-# ИСПРАВЛЕНО: root к этому моменту заблокирован, а битый файл в sudoers.d
-# ломает sudo целиком — это полная потеря доступа (только VNC + recovery).
-# Поэтому файл сначала проверяется отдельно и только потом устанавливается.
-SUDOERS_TMP=$(mktemp)
-cat > "${SUDOERS_TMP}" << 'EOF'
-# Тайм-аут sudo-сессии — 5 минут
+# ── 15. sudo ─────────────────────────────────────────────────────────────────
+step_sudo() {
+    if sudo --version 2>/dev/null | head -1 | grep -qi "sudo-rs"; then
+        info "Обнаружен sudo-rs — используются только общие с ним Defaults"
+    fi
+    # root заблокирован — битый sudoers означал бы полную потерю доступа
+    local tmp; make_tmp tmp
+    cat > "${tmp}" << 'EOF'
+# ubuntu_hardening.sh
 Defaults    timestamp_timeout=5
-# Команды в отдельном псевдотерминале: фоновый процесс не перехватит ввод
 Defaults    use_pty
-# Фиксированный безопасный PATH — защита от подмены системных утилит
 Defaults    secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 EOF
-chmod 440 "${SUDOERS_TMP}"
-if visudo -c -f "${SUDOERS_TMP}" &>/dev/null; then
-    mv "${SUDOERS_TMP}" /etc/sudoers.d/99-hardening
-    chown root:root /etc/sudoers.d/99-hardening
-    if visudo -c &>/dev/null; then
-        info "sudo: конфигурация корректна"
+    chmod 440 "${tmp}"
+    if visudo -c -f "${tmp}" &>/dev/null; then
+        track /etc/sudoers.d/99-hardening
+        mv "${tmp}" /etc/sudoers.d/99-hardening
+        chown root:root /etc/sudoers.d/99-hardening
+        if ! visudo -c &>/dev/null; then
+            rm -f /etc/sudoers.d/99-hardening
+            warn "sudoers в целом не прошёл проверку — наш файл убран (visudo -c)"
+        fi
     else
-        rm -f /etc/sudoers.d/99-hardening
-        warn "sudoers в целом не прошёл проверку — наш файл убран, проверьте: visudo -c"
+        warn "Настройки sudo не прошли visudo — НЕ установлены"
     fi
-else
-    rm -f "${SUDOERS_TMP}"
-    warn "Настройки sudo не прошли проверку visudo — НЕ установлены (sudo работает как раньше)"
-fi
 
-# Логирование sudo через rsyslog (без плагинов, работает на всех версиях)
-if ! grep -qs "sudo" /etc/rsyslog.d/*.conf 2>/dev/null; then
-    cat > /etc/rsyslog.d/50-sudo.conf << 'RSYSEOF'
-# Логи sudo в отдельный файл
+    # Отдельный лог sudo. rsyslog в Ubuntu пишет от имени syslog:adm — файл
+    # должен принадлежать ему (в v3 был root:root 600, и rsyslog не мог в него писать).
+    # Строки sudo остаются и в auth.log (без "& stop").
+    ensure_pkgs rsyslog
+    write_file /etc/rsyslog.d/50-sudo.conf 644 << 'EOF'
+# ubuntu_hardening.sh: копия событий sudo в отдельный файл
 :programname, isequal, "sudo" /var/log/sudo.log
-& stop
-RSYSEOF
-    systemctl restart rsyslog 2>/dev/null || true
-    info "sudo: логирование через rsyslog -> /var/log/sudo.log"
-fi
-
-touch /var/log/sudo.log
-chmod 600 /var/log/sudo.log
-
-info "sudo настроен: тайм-аут 5 мин, use_pty, secure_path, лог -> /var/log/sudo.log"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 16. Политика паролей (PAM / pwquality)
-# ──────────────────────────────────────────────────────────────────────────────
-section "16. Политика паролей"
-
-# Конфигурация pwquality записана в секции 3 — ДО задания пароля администратора
-if grep -q "^enforce_for_root" /etc/security/pwquality.conf 2>/dev/null; then
-    info "Политика паролей активна: минимум 16 символов, все классы, enforce_for_root"
-else
-    warn "/etc/security/pwquality.conf изменён вручную — проверьте политику"
-fi
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 17. Права на системные файлы
-# ──────────────────────────────────────────────────────────────────────────────
-section "17. Права на системные файлы"
-
-# 640 root:shadow (как в Ubuntu и CIS): при 600 setgid-утилита unix_chkpwd
-# не может проверять пароли для непривилегированных процессов
-chown root:shadow /etc/shadow /etc/gshadow
-chmod 640 /etc/shadow /etc/gshadow
-chmod 644 /etc/passwd /etc/group
-chmod 700 /boot 2>/dev/null || true
-
-# ИЗМЕНЕНО: symlink ~/.bash_history -> /dev/null удалён.
-# Отключение истории — антифорензика: она помогает атакующему скрыть
-# следы больше, чем защищает. Аудит команд root ведёт auditd (priv_exec).
-
-# Убрать SUID у нечасто используемых утилит
-for bin in /usr/bin/chfn /usr/bin/chsh /usr/bin/newgrp; do
-    [[ -u "$bin" ]] && { chmod u-s "$bin"; info "Убран SUID: $bin"; }
-done
-
-info "Права на системные файлы настроены"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 18. Удаление телеметрии
-# ──────────────────────────────────────────────────────────────────────────────
-section "18. Удаление телеметрии"
-
-for pkg in ubuntu-report popularity-contest apport whoopsie; do
-    # dpkg -s вместо dpkg -l: -l возвращал 0 даже для удалённых пакетов (статус rc)
-    if dpkg -s "$pkg" &>/dev/null; then
-        apt-get purge -y -qq "$pkg" && info "Удалён: $pkg" || warn "Не удалось удалить: $pkg"
+EOF
+    local owner="root:adm"
+    id syslog &>/dev/null && owner="syslog:adm"
+    install -o "${owner%:*}" -g "${owner#*:}" -m 640 /dev/null /var/log/sudo.log.new
+    if [[ -f /var/log/sudo.log ]]; then
+        chown "${owner}" /var/log/sudo.log; chmod 640 /var/log/sudo.log; rm -f /var/log/sudo.log.new
+    else
+        mv /var/log/sudo.log.new /var/log/sudo.log
     fi
-done
+    write_file /etc/logrotate.d/sudo-log 644 << EOF
+/var/log/sudo.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 640 ${owner/:/ }
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate 2>/dev/null || true
+    endscript
+}
+EOF
+    systemctl restart rsyslog 2>/dev/null || warn "rsyslog не перезапустился"
+    info "sudo: тайм-аут 5 мин, use_pty, secure_path; лог /var/log/sudo.log (${owner}, ротация)"
+}
 
-apt-get autoremove -y -qq
-apt-get autoclean -qq
+# ── 16. Пароли, login.defs, faillock ─────────────────────────────────────────
+faillock_enable() {
+    local ca=/etc/pam.d/common-auth cc=/etc/pam.d/common-account
+    track "${ca}" "${cc}" /etc/security/faillock.conf \
+          /usr/share/pam-configs/ubuntu-hardening-faillock \
+          /usr/share/pam-configs/ubuntu-hardening-faillock-notify
+    cat > /etc/security/faillock.conf << 'EOF'
+# ubuntu_hardening.sh: 5 неверных паролей за 15 минут -> блок на 15 минут.
+# root не блокируется (even_deny_root не задан). Снять: faillock --user <имя> --reset
+deny = 5
+fail_interval = 900
+unlock_time = 900
+audit
+EOF
+    cat > /usr/share/pam-configs/ubuntu-hardening-faillock << 'EOF'
+Name: Lockout after failed attempts (ubuntu_hardening.sh)
+Default: no
+Priority: 0
+Auth-Type: Primary
+Auth:
+	[default=die]	pam_faillock.so authfail
+EOF
+    cat > /usr/share/pam-configs/ubuntu-hardening-faillock-notify << 'EOF'
+Name: Check and reset failed-attempt counter (ubuntu_hardening.sh)
+Default: no
+Priority: 1024
+Auth-Type: Primary
+Auth:
+	requisite	pam_faillock.so preauth
+Account-Type: Primary
+Account:
+	required	pam_faillock.so
+EOF
+    pam-auth-update --package --enable ubuntu-hardening-faillock ubuntu-hardening-faillock-notify
 
-systemctl disable --now apport.service   2>/dev/null || true
-systemctl disable --now whoopsie.service 2>/dev/null || true
+    # Проверка порядка: preauth до pam_unix, authfail после, pam_unix на месте.
+    # Ошибка здесь сломала бы sudo при заблокированном root — тогда откатываем.
+    local order
+    order=$(grep -nE 'pam_(faillock|unix)\.so' "${ca}" | sed -E 's/^([0-9]+):.*pam_(faillock|unix)\.so ?([a-z]*).*/\2\3/' | tr '\n' ' ')
+    if [[ "${order}" == "faillockpreauth unixnullok faillockauthfail " || "${order}" == "faillockpreauth unix faillockauthfail " ]] \
+       && grep -qE '^account\s+required\s+pam_faillock\.so' "${cc}"; then
+        info "faillock: 5 неверных паролей -> блок 15 мин (faillock --user <имя> --reset)"
+    else
+        warn "faillock: неожиданный порядок модулей в ${ca} (${order}) — откатываю"
+        pam-auth-update --package --remove ubuntu-hardening-faillock ubuntu-hardening-faillock-notify || true
+        cp -a "${BACKUP_DIR}/files${ca}" "${ca}" 2>/dev/null || true
+        cp -a "${BACKUP_DIR}/files${cc}" "${cc}" 2>/dev/null || true
+        rm -f /usr/share/pam-configs/ubuntu-hardening-faillock /usr/share/pam-configs/ubuntu-hardening-faillock-notify
+    fi
+}
 
-if command -v snap &>/dev/null; then
-    snap set system metrics.status=disabled 2>/dev/null || true
-    info "Snap-метрики отключены"
-fi
+step_accounts() {
+    write_pwquality
+    info "Политика паролей: от 16 символов$([[ "${PASSWORD_CLASSES}" == "yes" ]] && echo ", все классы символов"), словарь, enforce_for_root"
 
-# motd-news и рекламные apt-news ходят на серверы Canonical при каждом входе
-if [[ -f /etc/default/motd-news ]]; then
-    sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
-    systemctl disable --now motd-news.timer 2>/dev/null || true
-fi
-command -v pro &>/dev/null && pro config set apt_news=false &>/dev/null || true
+    set_login_def UMASK 027
+    set_login_def PASS_MAX_DAYS "${PASSWORD_MAX_DAYS}"
+    set_login_def PASS_MIN_DAYS 1
+    set_login_def PASS_WARN_AGE 7
+    # shadow 4.8 (22.04) не знает YESCRYPT; passwd там и так пишет yescrypt через PAM
+    if [[ "${UBUNTU_VERSION}" != "22.04" ]]; then set_login_def ENCRYPT_METHOD YESCRYPT; fi
+    info "login.defs: UMASK 027, срок пароля ${PASSWORD_MAX_DAYS} дн."
+    if id "${ADMIN_USER}" &>/dev/null; then
+        chage --maxdays "${PASSWORD_MAX_DAYS}" --mindays 1 --warndays 7 "${ADMIN_USER}"
+        info "Срок пароля ${ADMIN_USER} (для sudo): ${PASSWORD_MAX_DAYS} дн."
+    fi
 
-info "Телеметрия удалена"
+    if [[ "${ENABLE_FAILLOCK}" == "yes" ]]; then
+        faillock_enable
+    else
+        info "faillock выключен (ENABLE_FAILLOCK=yes — блокировка после 5 неверных паролей sudo/su)"
+    fi
+}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 19. Автоматические security-обновления
-# ──────────────────────────────────────────────────────────────────────────────
-section "19. Автоматические security-обновления"
+# ── 17. Права ────────────────────────────────────────────────────────────────
+step_perms() {
+    # 640 root:shadow: при 600 unix_chkpwd не проверит пароль для непривилегированных процессов
+    chown root:shadow /etc/shadow /etc/gshadow
+    chmod 640 /etc/shadow /etc/gshadow
+    chmod 644 /etc/passwd /etc/group
+    chmod 700 /boot 2>/dev/null || true
+    # Снять SUID через dpkg-statoverride — иначе обновление пакета passwd вернёт его
+    local bin
+    for bin in /usr/bin/chfn /usr/bin/chsh /usr/bin/newgrp; do
+        [[ -e "${bin}" ]] || continue
+        if ! dpkg-statoverride --list "${bin}" &>/dev/null; then
+            dpkg-statoverride --update --add root root 0755 "${bin}"
+            track_action statoverride-remove "${bin}"
+            info "SUID снят (dpkg-statoverride): ${bin}"
+        fi
+    done
+}
 
-# ИСПРАВЛЕНО: v2 перезаписывала 50unattended-upgrades (файл пакета) — при
-# обновлении пакета новые умолчания терялись. Теперь свой файл 52-…, а #clear
-# заменяет списки целиком (без него apt ДОПИСАЛ бы наши значения к умолчаниям).
-# nginx/apache больше не исключены: это самые открытые наружу сервисы, их
-# security-исправления важнее короткого перезапуска.
-cat > /etc/apt/apt.conf.d/52unattended-upgrades-hardening << 'EOF'
+# ── 18. Телеметрия ───────────────────────────────────────────────────────────
+step_telemetry() {
+    local pkg
+    for pkg in ubuntu-report popularity-contest apport whoopsie; do
+        if dpkg -s "${pkg}" &>/dev/null; then
+            if "${APT_GET[@]}" purge -y -qq "${pkg}"; then info "Удалён: ${pkg}"; else warn "Не удалось удалить: ${pkg}"; fi
+        fi
+    done
+    "${APT_GET[@]}" autoremove -y -qq
+    "${APT_GET[@]}" autoclean -qq
+    if command -v snap &>/dev/null; then
+        snap set system metrics.status=disabled 2>/dev/null || true
+    fi
+    if [[ -f /etc/default/motd-news ]]; then
+        track /etc/default/motd-news
+        sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
+        systemctl disable --now motd-news.timer &>/dev/null || true
+    fi
+    if command -v pro &>/dev/null; then pro config set apt_news=false &>/dev/null || true; fi
+    info "Телеметрия удалена"
+}
+
+# ── 19. Автообновления ───────────────────────────────────────────────────────
+step_updates() {
+    ensure_pkgs unattended-upgrades needrestart
+    # Свой файл 52-… (файл пакета 50-… не трогаем); #clear заменяет списки целиком.
+    # Package-Blacklist — регулярные выражения от начала имени (re.match):
+    # "mysql" задерживает mysql-server*, но не libmysqlclient*
+    write_file /etc/apt/apt.conf.d/52unattended-upgrades-hardening 644 << 'EOF'
 // ubuntu_hardening.sh — переопределяет 50unattended-upgrades
 #clear Unattended-Upgrade::Allowed-Origins;
 Unattended-Upgrade::Allowed-Origins {
-    // Security-патчи
     "${distro_id}:${distro_codename}-security";
     "${distro_id}ESMApps:${distro_codename}-apps-security";
     "${distro_id}ESM:${distro_codename}-infra-security";
-    // Стабильные обновления (bugfix, не только security)
     "${distro_id}:${distro_codename}-updates";
 };
 
-// Сервисы с данными / оркестрация — вручную, чтобы контролировать даунтайм
+// Сервисы с данными / оркестрация — вручную, чтобы контролировать простой
 #clear Unattended-Upgrade::Package-Blacklist;
 Unattended-Upgrade::Package-Blacklist {
     "docker";
@@ -3586,181 +4026,547 @@ Unattended-Upgrade::Package-Blacklist {
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::MinimalSteps "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
-
-// На VPS не включаем авто-reboot — делайте сами в удобное время
-// (необходимость видна по файлу /var/run/reboot-required)
+// Без автоперезагрузки: нужна ли она — /var/run/reboot-required (и --audit)
 Unattended-Upgrade::Automatic-Reboot "false";
-
-// Писать письмо root только при ошибках (нужен MTA, иначе см. журнал:
-// /var/log/unattended-upgrades/)
 Unattended-Upgrade::Mail "root";
 Unattended-Upgrade::MailOnlyOnError "true";
 EOF
-
-# Если v2 перезаписала файл пакета — 52-… всё равно имеет приоритет (#clear)
-if grep -q "Разрешённые источники обновлений" /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null; then
-    info "50unattended-upgrades был изменён v2 — переопределён файлом 52-…"
-fi
-
-# needrestart: после обновления библиотек автоматически перезапускать сервисы,
-# иначе уязвимая версия остаётся загруженной в память до перезагрузки
-if [[ -d /etc/needrestart ]]; then
-    mkdir -p /etc/needrestart/conf.d
-    cat > /etc/needrestart/conf.d/50-hardening.conf << 'EOF'
-# ubuntu_hardening.sh: перезапускать сервисы автоматически
+    if [[ -d /etc/needrestart ]]; then
+        write_file /etc/needrestart/conf.d/50-hardening.conf 644 << 'EOF'
+# ubuntu_hardening.sh: перезапускать сервисы после обновления библиотек
 $nrconf{restart} = 'a';
 EOF
-    info "needrestart: автоматический перезапуск сервисов после обновлений"
-fi
-
-cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+    fi
+    write_file /etc/apt/apt.conf.d/20auto-upgrades 644 << 'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-
-mkdir -p /etc/systemd/system/apt-daily.timer.d
-cat > /etc/systemd/system/apt-daily.timer.d/override.conf << 'EOF'
+    write_file /etc/systemd/system/apt-daily.timer.d/override.conf 644 << 'EOF'
 [Timer]
-# Сбрасываем расписание по умолчанию (OnBootSec + OnUnitActiveSec)
 OnBootSec=
 OnCalendar=
 OnUnitActiveSec=
-# Запуск в 03:00 с разбросом до 10 минут (чтобы не все VPS стучались одновременно)
 OnCalendar=*-*-* 03:00
 RandomizedDelaySec=10m
 EOF
-
-mkdir -p /etc/systemd/system/apt-daily-upgrade.timer.d
-cat > /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf << 'EOF'
+    write_file /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf 644 << 'EOF'
 [Timer]
 OnBootSec=
 OnCalendar=
 OnUnitActiveSec=
-# 30 минут после apt-daily — достаточно для скачивания списков пакетов
 OnCalendar=*-*-* 03:30
 RandomizedDelaySec=10m
 EOF
+    systemctl daemon-reload
+    systemctl restart apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || warn "Таймеры apt не перезапустились"
+    info "Автообновления: списки 03:00, установка 03:30 (±10 мин); СУБД, Docker, kube — вручную"
+    info "Письма об ошибках идут root — без MTA смотрите /var/log/unattended-upgrades/ и --audit"
+}
 
-systemctl daemon-reload
-systemctl restart apt-daily.timer apt-daily-upgrade.timer
+# ── 19.1 journald и пересылка ────────────────────────────────────────────────
+step_journald() {
+    write_file /etc/systemd/journald.conf.d/50-ubuntu-hardening.conf 644 << EOF
+# ubuntu_hardening.sh: журнал переживает перезагрузку, но не больше квоты
+[Journal]
+Storage=persistent
+Compress=yes
+SystemMaxUse=${LOG_QUOTA_MB}M
+SystemKeepFree=$(( LOG_QUOTA_MB / 2 ))M
+EOF
+    mkdir -p /var/log/journal
+    systemd-tmpfiles --create --prefix /var/log/journal &>/dev/null || true
+    systemctl restart systemd-journald 2>/dev/null || warn "systemd-journald не перезапустился"
+    info "journald: persistent, не более ${LOG_QUOTA_MB} МБ"
 
-info "Автообновления настроены:"
-info "  apt-daily         : 03:00 ± 10 мин (обновление списков)"
-info "  apt-daily-upgrade : 03:30 ± 10 мин (установка обновлений)"
-info "  Вручную: docker, containerd, kube, СУБД (nginx/apache обновляются)"
-info "  Письмо root: только при ошибках"
-
-echo ""
-systemctl list-timers apt-daily.timer apt-daily-upgrade.timer --no-pager 2>/dev/null \
-    | sed 's/^/  /' || true
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 19.5 Шифрование LUKS (необязательно)
-#      До шага 20: для SSH-разблокировки нужны authorized_keys администратора.
-#      То же самое позже: bash ubuntu_hardening.sh --luks <режим>
-# ──────────────────────────────────────────────────────────────────────────────
-section "19.5 Шифрование LUKS (необязательно)"
-LUKS_DONE="пропущено"
-luks_menu
-grep -qsE '^[^#[:space:]]' /etc/crypttab && LUKS_DONE="настроено (см. --luks status)"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 20. Удаление приватного ключа с сервера
-# ──────────────────────────────────────────────────────────────────────────────
-section "20. Финальный шаг — приватный ключ и логи"
-
-# Логи v2 содержали приватный ключ в открытом виде — затираем такие файлы
-for _log in /root/hardening_*.log; do
-    [[ -f "${_log}" && "${_log}" != "${RUN_LOG}" ]] || continue
-    if grep -q "PRIVATE KEY-----" "${_log}" 2>/dev/null; then
-        shred -uz "${_log}" 2>/dev/null || rm -f "${_log}"
-        warn "Удалён старый лог с приватным ключом: ${_log}"
+    if [[ -n "${REMOTE_SYSLOG}" ]]; then
+        local host="${REMOTE_SYSLOG%:*}" port="${REMOTE_SYSLOG##*:}"
+        host="${host#[}"; host="${host%]}"
+        ensure_pkgs rsyslog audispd-plugins
+        # Файл 45-… раньше 50-default.conf: события auditd уходят наружу,
+        # но не дублируются в /var/log/syslog (они уже есть в audit.log)
+        write_file /etc/rsyslog.d/45-ubuntu-hardening-remote.conf 644 << EOF
+# ubuntu_hardening.sh: пересылка всех журналов на ${REMOTE_SYSLOG} по TCP.
+# Канал НЕ шифруется — используйте VPN/WireGuard или настройте TLS (gtls).
+*.* action(type="omfwd" target="${host}" port="${port}" protocol="tcp"
+           queue.type="LinkedList" queue.filename="uh_fwd" queue.maxDiskSpace="256m"
+           queue.saveOnShutdown="on" action.resumeRetryCount="-1")
+:programname, isequal, "audisp-syslog" stop
+EOF
+        local plug=/etc/audit/plugins.d/syslog.conf
+        if [[ -f "${plug}" ]]; then
+            track "${plug}"
+            sed -i -E 's/^(\s*active\s*=\s*).*/\1yes/' "${plug}"
+            systemctl restart auditd 2>/dev/null || true
+        else
+            warn "${plug} не найден — события auditd пересылаться не будут"
+        fi
+        systemctl restart rsyslog 2>/dev/null || warn "rsyslog не перезапустился"
+        STEP_NOTE[journald]="пересылка на ${REMOTE_SYSLOG} (TCP, без TLS)"
+        warn "Логи уходят на ${REMOTE_SYSLOG} без шифрования — только через доверенную сеть/VPN"
     fi
-done
+}
 
-if [[ "${KEY_SOURCE}" == "provided" ]]; then
-    info "Использовался ваш публичный ключ — приватного ключа на сервере нет"
-    if [[ -f "${KEY_PATH}" ]]; then
+# ── 19.2 AIDE ────────────────────────────────────────────────────────────────
+step_aide() {
+    if [[ "${ENABLE_AIDE}" != "yes" ]]; then
+        step_off "AIDE выключен (ENABLE_AIDE=yes)"
+        return 0
+    fi
+    ensure_pkgs aide aide-common
+    info "Построение базы AIDE (несколько минут)…"
+    if aideinit -y -f >/dev/null 2>&1; then
+        info "База AIDE создана; ежедневная проверка — dailyaidecheck / cron.daily"
+        systemctl enable --now dailyaidecheck.timer &>/dev/null || true
+    else
+        warn "aideinit завершился с ошибкой"
+    fi
+}
+
+# ── 19.5 LUKS ────────────────────────────────────────────────────────────────
+step_luks() {
+    if [[ "${ASSUME_YES}" == "yes" ]]; then
+        step_off "в режиме --yes не выполняется: bash ubuntu_hardening.sh --luks <режим>"
+        return 0
+    fi
+    luks_menu
+    if grep -qsE '^[^#[:space:]]' /etc/crypttab; then STEP_NOTE[luks]="настроено (--luks status)"
+    else STEP_NOTE[luks]="не настроено"; fi
+}
+
+# ── 20. Итог: ключ, старые логи, лишние службы ───────────────────────────────
+step_finish() {
+    # Логи v2 содержали приватный ключ в открытом виде
+    local log
+    for log in /root/hardening_*.log; do
+        [[ -f "${log}" && "${log}" != "${RUN_LOG}" ]] || continue
+        if grep -q "PRIVATE KEY-----" "${log}" 2>/dev/null; then
+            shred -uz "${log}" 2>/dev/null || rm -f "${log}"
+            warn "Удалён старый лог с приватным ключом: ${log}"
+        fi
+    done
+
+    if [[ "${KEY_SOURCE:-}" == "generated" && -f "${KEY_PATH}" ]]; then
+        echo ""
+        echo -e "${RED}+------------------------------------------------------------+${NC}"
+        echo -e "${RED}|  УДАЛЕНИЕ ПРИВАТНОГО КЛЮЧА С СЕРВЕРА                       |${NC}"
+        echo -e "${RED}|  Root по SSH уже запрещён — scp под root не сработает.     |${NC}"
+        echo -e "${RED}|  Если ключ не сохранён, его можно показать ещё раз здесь.  |${NC}"
+        echo -e "${RED}+------------------------------------------------------------+${NC}"
+        if confirm "Показать приватный ключ ещё раз?"; then
+            sleep 0.3
+            { echo ""; cat "${KEY_PATH}"; echo ""; } > /dev/tty
+        fi
+        if confirm "Ключ сохранён и вход под ${ADMIN_USER} работает? Удалить ключ с сервера?"; then
+            shred -uz "${KEY_PATH}" 2>/dev/null || rm -f "${KEY_PATH}"
+            info "Приватный ключ удалён с сервера"
+        else
+            warn "Ключ оставлен: ${KEY_PATH} — удалите после сохранения: sudo shred -uz ${KEY_PATH}"
+        fi
+    elif [[ -f "${KEY_PATH}" && "${KEY_SOURCE:-}" != "generated" ]]; then
         shred -uz "${KEY_PATH}" 2>/dev/null || rm -f "${KEY_PATH}"
         info "Удалён приватный ключ прошлого прогона: ${KEY_PATH}"
     fi
-else
-    # ИСПРАВЛЕНО: v2 советовала здесь "scp -P 22 root@…", но root по SSH уже
-    # запрещён, а порт сменён — скачать так невозможно. Если ключ не сохранён,
-    # единственный путь — показать его ещё раз на этом терминале.
-    echo ""
-    echo -e "${RED}+------------------------------------------------------------+${NC}"
-    echo -e "${RED}|  ПОСЛЕДНИЙ ШАГ: УДАЛЕНИЕ ПРИВАТНОГО КЛЮЧА С СЕРВЕРА        |${NC}"
-    echo -e "${RED}|                                                            |${NC}"
-    echo -e "${RED}|  Root по SSH уже запрещён — scp под root не сработает.     |${NC}"
-    echo -e "${RED}|  Если ключ не сохранён, его можно показать ещё раз здесь.  |${NC}"
-    echo -e "${RED}+------------------------------------------------------------+${NC}"
-    echo ""
-    read -r -p "Показать приватный ключ ещё раз? [y/N]: " _show_key
-    if [[ "${_show_key}" =~ ^[Yy]$ ]]; then
-        sleep 0.3
-        { echo ""; cat "${KEY_PATH}"; echo ""; } > /dev/tty
-    fi
-    read -r -p "Ключ сохранён и вход под ${ADMIN_USER} работает? Удалить ключ с сервера? [y/N]: " confirm
 
-    if [[ "${confirm}" =~ ^[Yy]$ ]]; then
-        if command -v shred &>/dev/null; then
-            shred -uz "${KEY_PATH}"
-        else
-            rm -f "${KEY_PATH}"
-        fi
-        info "Приватный ключ надёжно удалён с сервера"
-        info "Публичный ключ оставлен: ${KEY_PATH}.pub"
-    else
-        warn "Ключ оставлен по адресу: ${KEY_PATH}"
-        warn "Удалите после сохранения: sudo shred -uz ${KEY_PATH}"
+    # Лишние службы, которые часто остаются в образах
+    local svc found=()
+    for svc in rpcbind.service rpcbind.socket avahi-daemon.service avahi-daemon.socket \
+               cups.service cups.socket cups-browsed.service ModemManager.service bluetooth.service; do
+        systemctl is-enabled "${svc}" &>/dev/null && found+=("${svc}")
+    done
+    if (( ${#found[@]} )); then
+        echo ""
+        info "Включены службы, обычно ненужные на сервере: ${found[*]}"
+        for svc in "${found[@]}"; do
+            if [[ " ${DISABLE_SERVICES} " == *" ${svc%.*} "* || " ${DISABLE_SERVICES} " == *" ${svc} "* ]] \
+               || confirm "  Отключить ${svc}?"; then
+                systemctl disable --now "${svc}" &>/dev/null && track_action unit-enable "${svc}" \
+                    && info "  Отключена: ${svc}"
+            fi
+        done
     fi
+
+    echo ""
+    info "Слушают не только localhost:"
+    ss -Htlnu 2>/dev/null | awk '$5 !~ /^(127\.|\[::1\]|::1)/ {print "    " $1 "  " $5}' | sort -u || true
+
+    save_state
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  --audit: проверка состояния без изменений
+# ══════════════════════════════════════════════════════════════════════════════
+A_PASS=0; A_FAIL=0; A_WARN=0
+a_pass() { A_PASS=$(( A_PASS + 1 )); echo -e "  ${GREEN}PASS${NC}  $*"; }
+a_fail() { A_FAIL=$(( A_FAIL + 1 )); echo -e "  ${RED}FAIL${NC}  $*"; }
+a_warn() { A_WARN=$(( A_WARN + 1 )); echo -e "  ${YELLOW}WARN${NC}  $*"; }
+a_check() {   # a_check <описание> <команда...>
+    local d="$1"; shift
+    if "$@" &>/dev/null; then a_pass "$d"; else a_fail "$d"; fi
+}
+a_eff() {   # a_eff <ключ sshd -T> <ожидаемое значение>
+    if grep -qx "$1 $2" <<< "${A_SSHD}"; then a_pass "sshd: $1 $2"
+    else a_fail "sshd: $1 = $(awk -v k="$1" '$1==k{$1=""; print substr($0,2)}' <<< "${A_SSHD}" | head -1) (ожидалось $2)"; fi
+}
+a_mount_opts() {   # a_mount_opts <точка> <опция>...
+    local mp="$1" opts o miss=""; shift
+    opts=$(findmnt -no OPTIONS "${mp}" 2>/dev/null | head -1)
+    if [[ -z "${opts}" ]]; then a_fail "${mp}: не смонтирован отдельно (нужен reboot?)"; return; fi
+    for o in "$@"; do [[ ",${opts}," == *",${o},"* ]] || miss+=" ${o}"; done
+    if [[ -z "${miss}" ]]; then a_pass "${mp}: $*"; else a_fail "${mp}: нет${miss}"; fi
+}
+
+run_audit() {
+    local user port
+    user=$(kv_get "${STATE_FILE}" ADMIN_USER); user="${user:-${ADMIN_USER}}"
+    port=$(kv_get "${STATE_FILE}" SSH_PORT);   port="${port:-${SSH_PORT}}"
+    local home_noexec; home_noexec=$(kv_get "${STATE_FILE}" HOME_NOEXEC); home_noexec="${home_noexec:-yes}"
+    echo ""
+    echo "ubuntu_hardening.sh ${SCRIPT_VERSION} — проверка ($(hostname), $(date '+%F %T'))"
+    echo "Администратор: ${user}, порт SSH: ${port}"
+
+    section "SSH"
+    A_SSHD=$(sshd -T -C "user=${user},host=localhost,addr=127.0.0.1" 2>/dev/null || true)
+    if [[ -z "${A_SSHD}" ]]; then
+        a_fail "sshd -T не выполнился"
+    else
+        a_eff port "${port}"
+        a_eff permitrootlogin no
+        a_eff passwordauthentication no
+        a_eff kbdinteractiveauthentication no
+        a_eff authenticationmethods publickey
+        a_eff allowagentforwarding no
+        a_eff x11forwarding no
+        a_eff permittunnel no
+        a_eff permituserenvironment no
+        a_eff maxauthtries 3
+        if grep -qE "^allowusers( .*)? ${user}( |$)" <<< "${A_SSHD}"; then a_pass "sshd: ${user} в AllowUsers"
+        else a_fail "sshd: ${user} не в AllowUsers"; fi
+    fi
+    if systemctl is-enabled ssh.socket &>/dev/null; then a_fail "ssh.socket включён (Port из sshd_config игнорируется)"
+    else a_pass "ssh.socket выключен"; fi
+    local ak; ak="$(getent passwd "${user}" | cut -d: -f6)/.ssh/authorized_keys"
+    local nk; nk=$(ssh-keygen -l -f "${ak}" 2>/dev/null | wc -l)
+    if (( nk > 0 )); then a_pass "${ak}: ключей ${nk}"; else a_fail "${ak}: нет ключей"; fi
+
+    section "Учётные записи"
+    local rs; rs=$(passwd -S root 2>/dev/null | awk '{print $2}')
+    if [[ "${rs}" == "L" || "${rs}" == "NP" ]]; then a_pass "root: пароль заблокирован"; else a_fail "root: пароль не заблокирован (${rs})"; fi
+    if grep -qE '^\s*auth\s+required\s+pam_wheel\.so.*group=sudo' /etc/pam.d/su 2>/dev/null; then a_pass "su только для группы sudo"
+    else a_fail "su не ограничен (pam_wheel)"; fi
+    if grep -qs '^enforce_for_root' /etc/security/pwquality.conf.d/*.conf /etc/security/pwquality.conf; then a_pass "pwquality: enforce_for_root"
+    else a_fail "pwquality: enforce_for_root не задан"; fi
+    a_check "sudoers: visudo -c" visudo -c
+    a_check "sudoers: use_pty" grep -qs 'use_pty' /etc/sudoers.d/99-hardening
+    local sl; sl=$(stat -c '%U:%G %a' /var/log/sudo.log 2>/dev/null || echo "нет")
+    if [[ "${sl}" == "syslog:adm 640" || "${sl}" == "root:adm 640" ]]; then a_pass "/var/log/sudo.log: ${sl}"
+    else a_fail "/var/log/sudo.log: ${sl} (rsyslog не сможет писать)"; fi
+    local sh; sh=$(stat -c '%U:%G %a' /etc/shadow)
+    if [[ "${sh}" == "root:shadow 640" || "${sh}" == "root:shadow 600" ]]; then a_pass "/etc/shadow: ${sh}"; else a_fail "/etc/shadow: ${sh}"; fi
+
+    section "Сеть"
+    local ufw_out; ufw_out=$(ufw status verbose 2>/dev/null || true)
+    if grep -q "^Status: active" <<< "${ufw_out}"; then a_pass "UFW активен"; else a_fail "UFW не активен"; fi
+    if grep -q "deny (incoming)" <<< "${ufw_out}"; then a_pass "UFW: deny incoming"; else a_fail "UFW: входящие не запрещены по умолчанию"; fi
+    if grep -qE "^${port}/tcp" <<< "${ufw_out}"; then a_pass "UFW: правило для SSH ${port}"; else a_fail "UFW: нет правила для ${port}/tcp"; fi
+    if has_docker; then
+        if grep -qs "BEGIN UBUNTU_HARDENING DOCKER-USER" /etc/ufw/after.rules; then a_pass "Docker: DOCKER-USER закрывает опубликованные порты"
+        else a_warn "Docker: опубликованные порты доступны в обход UFW"; fi
+    fi
+    local f2b; f2b=$(fail2ban-client status sshd 2>/dev/null || true)
+    if [[ -n "${f2b}" ]]; then a_pass "fail2ban: jail sshd активен"; else a_fail "fail2ban: jail sshd не работает"; fi
+
+    section "Ядро (sysctl: файл против текущих значений)"
+    local key val cur drift=0 total=0
+    while IFS='=' read -r key val; do
+        key="${key//[[:space:]]/}"; val="${val#"${val%%[![:space:]]*}"}"
+        [[ -z "${key}" || "${key}" == \#* ]] && continue
+        total=$(( total + 1 ))
+        cur=$(sysctl -n "${key}" 2>/dev/null || echo "?")
+        if [[ "${cur}" != "${val}" ]]; then
+            drift=$(( drift + 1 )); a_fail "sysctl ${key} = ${cur} (в файле ${val})"
+        fi
+    done < <(grep -vE '^\s*(#|$)' /etc/sysctl.d/99-hardening.conf 2>/dev/null || true)
+    if (( total == 0 )); then a_fail "/etc/sysctl.d/99-hardening.conf не найден"
+    elif (( drift == 0 )); then a_pass "sysctl: все ${total} параметров совпадают"; fi
+
+    local m bad=""
+    while read -r _ m _; do
+        [[ -d "/sys/module/${m}" ]] && bad+=" ${m}"
+    done < <(grep -E '^install ' /etc/modprobe.d/hardening-blacklist.conf 2>/dev/null || true)
+    if [[ ! -f /etc/modprobe.d/hardening-blacklist.conf ]]; then a_fail "Blacklist модулей не установлен"
+    elif [[ -z "${bad}" ]]; then a_pass "Заблокированные модули не загружены"; else a_fail "Загружены:${bad}"; fi
+
+    section "Разделы"
+    a_mount_opts /tmp nosuid nodev noexec
+    a_mount_opts /dev/shm nosuid nodev noexec
+    a_mount_opts /var/tmp nosuid nodev noexec
+    if [[ "${home_noexec}" == "yes" ]]; then a_mount_opts /home nosuid nodev noexec
+    else a_mount_opts /home nosuid nodev; fi
+
+    section "Аудит и журналы"
+    a_check "auditd активен" systemctl is-active --quiet auditd
+    local ast; ast=$(auditctl -s 2>/dev/null || true)
+    if grep -q "enabled 2" <<< "${ast}"; then a_pass "auditd: правила неизменяемы (enabled 2)"; else a_warn "auditd: правила изменяемы (нужен reboot?)"; fi
+    local nr; nr=$(auditctl -l 2>/dev/null | grep -vc "^No rules" || true)
+    if (( nr > 50 )); then a_pass "auditd: загружено правил ${nr}"; else a_fail "auditd: загружено правил ${nr}"; fi
+    local lost; lost=$(awk '$1=="lost"{print $2}' <<< "${ast}")
+    if [[ -n "${lost}" && "${lost}" != "0" ]]; then a_warn "auditd: потеряно событий ${lost} (backlog мал или поток велик)"; fi
+    local bl; bl=$(awk '$1=="backlog_limit"{print $2}' <<< "${ast}")
+    [[ -n "${bl}" ]] && echo "        backlog_limit ${bl}"
+    if aa-status --enabled 2>/dev/null; then a_pass "AppArmor активен"; else a_fail "AppArmor не активен"; fi
+    a_check "journald: drop-in с квотой" test -f /etc/systemd/journald.conf.d/50-ubuntu-hardening.conf
+    a_check "core dump: limits.d" test -f /etc/security/limits.d/99-ubuntu-hardening-core.conf
+
+    section "Обновления"
+    a_check "unattended-upgrades включены" grep -qs 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades
+    a_check "таймер apt-daily-upgrade активен" systemctl is-active --quiet apt-daily-upgrade.timer
+    if [[ -f /var/run/reboot-required ]]; then a_warn "Требуется перезагрузка ($(tr '\n' ' ' < /var/run/reboot-required.pkgs 2>/dev/null | cut -c1-80))"
+    else a_pass "Перезагрузка не требуется"; fi
+    local up; up=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c '^Inst ' || true)
+    if (( up > 0 )); then a_warn "Ожидают установки пакетов: ${up} (часть — из Package-Blacklist)"; else a_pass "Все пакеты обновлены"; fi
+    local pkg tel=""
+    for pkg in ubuntu-report popularity-contest apport whoopsie; do dpkg -s "${pkg}" &>/dev/null && tel+=" ${pkg}"; done
+    if [[ -z "${tel}" ]]; then a_pass "Телеметрия удалена"; else a_fail "Установлены:${tel}"; fi
+
+    echo ""
+    echo -e "Итого: ${GREEN}PASS ${A_PASS}${NC}  ${RED}FAIL ${A_FAIL}${NC}  ${YELLOW}WARN ${A_WARN}${NC}"
+    (( A_FAIL == 0 ))
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  --rollback: восстановление файлов прогона
+# ══════════════════════════════════════════════════════════════════════════════
+run_rollback() {
+    if [[ -z "${ROLLBACK_STAMP}" ]]; then
+        echo "Резервные копии прогонов (${BACKUP_ROOT}):"
+        local d
+        for d in "${BACKUP_ROOT}"/*/; do
+            [[ -f "${d}manifest" ]] || continue
+            printf '  %s  изменений: %s\n' "$(basename "${d}")" "$(wc -l < "${d}manifest")"
+        done
+        echo "Откат: bash ubuntu_hardening.sh --rollback <метка>"
+        return 0
+    fi
+    local dir="${BACKUP_ROOT}/${ROLLBACK_STAMP}" man
+    man="${dir}/manifest"
+    [[ "${ROLLBACK_STAMP}" =~ ^[0-9_]+$ && -f "${man}" ]] || error "Нет прогона ${ROLLBACK_STAMP} (список: --rollback)"
+    echo "Будет восстановлено из ${dir}:"
+    sed 's/^/  /' "${man}"
+    echo ""
+    warn "Не откатываются: пользователи и пароли (в т.ч. блокировка root — passwd root),"
+    warn "удалённые пакеты, неизменяемые правила auditd (до reboot), LUKS."
+    [[ "${ASSUME_YES}" == "yes" ]] || confirm "Выполнить откат?" || exit 0
+
+    local kind path line restored=0
+    while IFS= read -r line; do
+        kind="${line%% *}"; path="${line#* }"
+        case "${kind}" in
+            saved)  if [[ -e "${dir}/files${path}" || -L "${dir}/files${path}" ]]; then
+                        mkdir -p "$(dirname "${path}")"
+                        rm -f "${path}"
+                        cp -a "${dir}/files${path}" "${path}"
+                        restored=$(( restored + 1 ))
+                    fi ;;
+            new)    rm -f "${path}" ;;
+            unit-enable)  systemctl enable "${path}" &>/dev/null || warn "Не удалось включить ${path}" ;;
+            unit-disable) systemctl disable "${path}" &>/dev/null || true ;;
+            statoverride-remove)
+                    dpkg-statoverride --remove "${path}" &>/dev/null || true
+                    chmod u+s "${path}" 2>/dev/null || true ;;
+            *)      warn "Неизвестная запись: ${line}" ;;
+        esac
+    done < <(tac "${man}")
+    info "Восстановлено файлов: ${restored}"
+
+    systemctl daemon-reload || true
+    sysctl --system -q || true
+    if grep -q "^saved /etc/ssh/sshd_config$" "${man}"; then
+        if sshd -t; then
+            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+            systemctl is-enabled ssh.socket &>/dev/null && systemctl restart ssh.socket || true
+            info "sshd перезапущен со старой конфигурацией"
+        else
+            warn "Восстановленный sshd_config не проходит sshd -t — sshd НЕ перезапущен"
+        fi
+    fi
+    if grep -q "^saved /etc/ufw/" "${man}"; then
+        if grep -qs '^ENABLED=yes' /etc/ufw/ufw.conf; then ufw reload >/dev/null || true
+        else ufw --force disable >/dev/null || true; fi
+        info "UFW: правила восстановлены"
+    fi
+    systemctl restart rsyslog chrony fail2ban 2>/dev/null || true
+    augenrules --load &>/dev/null || true
+    warn "Изменения fstab, модулей и auditd вступят в силу после перезагрузки"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ЗАПУСК
+# ══════════════════════════════════════════════════════════════════════════════
+[[ $EUID -eq 0 ]] || error "Запускайте скрипт от root"
+
+on_err() { echo -e "${RED}[x]${NC} Ошибка на строке $1: $2${RUN_LOG:+ (см. ${RUN_LOG})}"; }
+on_exit() {
+    local rc=$? h
+    set +e
+    for h in "${EXIT_HOOKS[@]}"; do "$h"; done
+    (( ${#TMP_FILES[@]} )) && rm -f "${TMP_FILES[@]}"
+    if (( rc != 0 )) && [[ "${RUN_MODE}" == "harden" && -n "${CURRENT_STEP}" ]]; then
+        local s rest="" seen="no"
+        for s in "${STEPS_ALL[@]}"; do
+            [[ "$s" == "${CURRENT_STEP}" ]] && seen="yes"
+            [[ "${seen}" == "yes" ]] && step_enabled "$s" && rest+="${rest:+,}$s"
+        done
+        echo -e "${RED}[x]${NC} Остановлено на шаге '${CURRENT_STEP}' (${STEP_TITLE[${CURRENT_STEP}]})."
+        echo "    После исправления продолжить: bash $0 --only ${rest}"
+        echo "    Откатить изменённые файлы:    bash $0 --rollback ${RUN_STAMP}"
+    fi
+    if [[ -n "${TEE_PID:-}" ]]; then
+        exec 1>&- 2>&-
+        wait "${TEE_PID}" 2>/dev/null
+    fi
+    return "${rc}"
+}
+trap on_exit EXIT
+trap 'on_err "${LINENO}" "${BASH_COMMAND}"' ERR
+
+# luks_run из блока LUKS: ERR-trap внутри подоболочки, без ложного сообщения снаружи
+luks_run() {
+    local rc
+    trap - ERR
+    set +e
+    ( trap 'on_err "${LINENO}" "${BASH_COMMAND}"' ERR; set -e; luks_main "$@" )
+    rc=$?
+    set -e
+    trap 'on_err "${LINENO}" "${BASH_COMMAND}"' ERR
+    (( rc == 0 )) || warn "LUKS: режим не завершён (код ${rc}) — харденинг продолжается"
+    return 0
+}
+
+if [[ "${RUN_MODE}" == "audit" ]]; then
+    if run_audit; then exit 0; else exit 1; fi
 fi
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ИТОГ
-# ──────────────────────────────────────────────────────────────────────────────
+if [[ "${RUN_MODE}" == "harden" && "${ASSUME_YES}" != "yes" && ! -t 0 ]]; then
+    error "Без терминала запускайте с --yes и --config (интерактивный режим требует TTY)"
+fi
+
+# ── Лог выполнения ───────────────────────────────────────────────────────────
+# Секреты (приватный ключ) пишутся напрямую в /dev/tty и в лог не попадают.
+RUN_LOG="/root/hardening_${RUN_MODE}_${RUN_STAMP}.log"
+( umask 077; : > "${RUN_LOG}" )
+exec > >(tee -a "${RUN_LOG}") 2>&1
+TEE_PID=$!
+info "ubuntu_hardening.sh ${SCRIPT_VERSION}; лог: ${RUN_LOG}"
+
+if [[ "${RUN_MODE}" == "luks" ]]; then
+    luks_main "${LUKS_ARGS[@]}"
+    exit 0
+fi
+if [[ "${RUN_MODE}" == "rollback" ]]; then
+    run_rollback
+    exit 0
+fi
+
+# ── Версия ОС ────────────────────────────────────────────────────────────────
+[[ -f /etc/os-release ]] || error "Не удалось определить ОС (/etc/os-release не найден)"
+OS_ID=$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print $2}' /etc/os-release)
+UBUNTU_VERSION=$(awk -F= '$1=="VERSION_ID"{gsub(/"/,"",$2); print $2}' /etc/os-release)
+UBUNTU_VERSION="${UBUNTU_VERSION:-unknown}"
+
+# ── Настройки: умолчания < прошлый прогон < --config < UH_* ──────────────────
+load_state_defaults
+[[ -n "${CONFIG_FILE}" ]] && load_kv_file "${CONFIG_FILE}"
+load_env_overrides
+validate_settings
+APPLIED_ADMIN_USER="${ADMIN_USER}"
+APPLIED_SSH_PORT="${SSH_PORT}"
+# Шаги, которые сами не спрашивают порт/пользователя, работают с применёнными значениями
+if ! step_enabled ssh && kv_has "${STATE_FILE}" SSH_PORT; then
+    SSH_PORT=$(kv_get "${STATE_FILE}" SSH_PORT); APPLIED_SSH_PORT="${SSH_PORT}"
+fi
+if ! step_enabled user && ! step_enabled key && ! step_enabled ssh && kv_has "${STATE_FILE}" ADMIN_USER; then
+    ADMIN_USER=$(kv_get "${STATE_FILE}" ADMIN_USER); APPLIED_ADMIN_USER="${ADMIN_USER}"
+fi
+
+if [[ "${OS_ID}" != "ubuntu" ]]; then
+    [[ "${ALLOW_UNTESTED_OS}" == "yes" ]] || error "ОС '${OS_ID}' — не Ubuntu. Скрипт рассчитан на Ubuntu (ALLOW_UNTESTED_OS=yes — на свой риск)"
+    warn "ОС '${OS_ID}' — не Ubuntu, ALLOW_UNTESTED_OS=yes"
+fi
+case "${UBUNTU_VERSION}" in
+    22.04|24.04|26.04) info "Ubuntu ${UBUNTU_VERSION} — поддерживается" ;;
+    *)  warn "Ubuntu ${UBUNTU_VERSION} — не тестировалась (рассчитано на 22.04 / 24.04 / 26.04)"
+        if [[ "${ALLOW_UNTESTED_OS}" != "yes" ]]; then
+            confirm "Продолжить?" || error "Прервано по версии ОС"
+        fi ;;
+esac
+
+# ── Первые минуты VPS: дождаться cloud-init (он держит apt и пишет конфиги) ──
+if command -v cloud-init &>/dev/null; then
+    info "Ожидание завершения cloud-init…"
+    timeout 600 cloud-init status --wait &>/dev/null || warn "cloud-init не завершился за 10 мин — продолжаем"
+fi
+
+HYPERVISOR=$(systemd-detect-virt 2>/dev/null || echo "unknown")
+info "Виртуализация: ${HYPERVISOR}"
+TOTAL_RAM_KB=$(awk '/^MemTotal/{print $2}' /proc/meminfo)
+
+# ── Квоты логов: не более 10% свободного места ───────────────────────────────
+LOG_PARTITION=$(df --output=target /var/log 2>/dev/null | tail -1)
+FREE_KB=$(df -k "${LOG_PARTITION}" | awk 'NR==2{print $4}')
+LOG_QUOTA_MB=$(( FREE_KB / 10 / 1024 ))
+(( LOG_QUOTA_MB < 50 ))   && LOG_QUOTA_MB=50
+(( LOG_QUOTA_MB > 2048 )) && LOG_QUOTA_MB=2048
+AUDIT_NUM_LOGS=5
+AUDIT_MAX_FILE_MB=$(( LOG_QUOTA_MB / AUDIT_NUM_LOGS ))
+(( AUDIT_MAX_FILE_MB < 10 )) && AUDIT_MAX_FILE_MB=10
+# audit backlog — буфер в памяти ядра, из объёма RAM
+AUDIT_BACKLOG=$(( TOTAL_RAM_KB / 1024 * 8 ))
+(( AUDIT_BACKLOG < 8192 ))  && AUDIT_BACKLOG=8192
+(( AUDIT_BACKLOG > 65536 )) && AUDIT_BACKLOG=65536
+info "Квота логов: ${LOG_QUOTA_MB} МБ (раздел ${LOG_PARTITION}); audit backlog: ${AUDIT_BACKLOG}"
+
+KEY_SOURCE=""; KEY_TYPE="не менялся"; GEN_KEY_TYPE=""
+PUBKEYS=(); PUBKEY_BODIES=""
+SSH_CHECKPOINT_DONE="no"
+[[ "${ASSUME_YES}" == "yes" ]] && info "Режим --yes: вопросы не задаются"
+[[ -n "${ONLY_STEPS}" ]] && info "Только шаги: ${ONLY_STEPS}"
+[[ -n "${SKIP_STEPS}" ]] && info "Пропуск шагов: ${SKIP_STEPS}"
+
+collect_answers
+
+for _s in "${STEPS_ALL[@]}"; do run_step "${_s}"; done
+CURRENT_STEP=""
+# Настройки прогона — для --luks, --audit и следующего запуска
+if [[ -f "${STATE_FILE}" ]] || id "${APPLIED_ADMIN_USER}" &>/dev/null; then save_state; fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ИТОГ
+# ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${GREEN}+============================================================+${NC}"
-echo -e "${GREEN}|             HARDENING ЗАВЕРШЁН УСПЕШНО                    |${NC}"
+echo -e "${GREEN}|                 HARDENING: ИТОГ ПРОГОНА                    |${NC}"
 echo -e "${GREEN}+============================================================+${NC}"
+# Статус — первым столбцом: printf выравнивает по байтам, а заголовки кириллические
+for _s in "${STEPS_ALL[@]}"; do
+    case "${STEP_STATUS[${_s}]:-SKIP}" in
+        OK)   _st="${GREEN}[OK]  ${NC}" ;;
+        WARN) _st="${YELLOW}$(printf '[!%-3s]' "${STEP_WARNS[${_s}]}")${NC}" ;;
+        OFF)  _st="[--]  " ;;
+        *)    _st="[skip]" ;;
+    esac
+    echo -e "  ${_st}  ${STEP_TITLE[${_s}]}${STEP_NOTE[${_s}]:+ — ${STEP_NOTE[${_s}]}}"
+done
 echo ""
-printf "  %-48s %s\n" "SSH-ключ: ${KEY_TYPE}"                  "[OK]"
-printf "  %-48s %s\n" "Пользователь '${ADMIN_USER}' создан"    "[OK]"
-printf "  %-48s %s\n" "SSH: порт ${SSH_PORT}, только ключи, PQ-KEX" "[OK]"
-printf "  %-48s %s\n" "ssh.socket отключён (Port применяется)" "[OK]"
-printf "  %-48s %s\n" "Root заблокирован, su только для sudo"  "[OK]"
-printf "  %-48s %s\n" "UFW: разрешён только SSH:${SSH_PORT}${EXTRA_PORTS:+ + свои}" "[OK]"
-printf "  %-48s %s\n" "Fail2ban: 3 попытки -> бан 24ч, recidive" "[OK]"
-printf "  %-48s %s\n" "sysctl: сеть + ядро (rp_filter=${RP_FILTER})" "[OK]"
-printf "  %-48s %s\n" "Blacklist: опасные ФС/протоколы"        "[OK]"
-printf "  %-48s %s\n" "/tmp /dev/shm /var/tmp /home: noexec"   "[OK]"
-printf "  %-48s %s\n" "Cron: только root"                      "[OK]"
-printf "  %-48s %s\n" "Auditd: расширенные правила, immutable" "[OK]"
-printf "  %-48s %s\n" "Core dump отключён"                     "[OK]"
-printf "  %-48s %s\n" "AppArmor: активен (отчёт выше)"         "[OK]"
-printf "  %-48s %s\n" "sudo: проверен visudo, use_pty, лог"    "[OK]"
-printf "  %-48s %s\n" "Политика паролей: 16+ символов"         "[OK]"
-printf "  %-48s %s\n" "Телеметрия удалена"                     "[OK]"
-printf "  %-48s %s\n" "Автообновления + needrestart"           "[OK]"
-printf "  %-48s %s\n" "LUKS: ${LUKS_DONE}"                     "[--]"
+echo "  [OK] выполнено  [!N] N предупреждений (см. выше и лог)"
+echo "  [--] выключено настройкой  [skip] не выбран (--only/--skip)"
 echo ""
-echo -e "  ${YELLOW}Лог выполнения:${NC} ${RUN_LOG}"
+echo -e "  ${YELLOW}Лог:${NC} ${RUN_LOG}"
+echo -e "  ${YELLOW}Откат файлов:${NC} bash $0 --rollback ${RUN_STAMP}"
 echo ""
-echo -e "  ${YELLOW}Требуется перезагрузка для:${NC}"
-echo "    - blacklist модулей ядра (DCCP, SCTP, редкие ФС)"
-echo "    - /var/tmp и /home bind-mount (если не применились)"
-echo "    - kexec_load_disabled, правила auditd (immutable)"
-echo "    - ограничения user namespaces (на части ядер)"
+echo -e "  ${YELLOW}Перезагрузка нужна для:${NC} blacklist модулей, /tmp и /home (если не применились),"
+echo "    kexec_load_disabled, неизменяемых правил auditd, hidepid и параметров GRUB"
 echo ""
-echo -e "  ${CYAN}Подключение после reboot:${NC}"
-echo "    ssh -p ${SSH_PORT} -i ./admin_ssh_key ${ADMIN_USER}@<IP>"
-echo ""
-echo -e "  ${CYAN}Полезные команды:${NC}"
-echo "    fail2ban-client status sshd       # статус банов"
-echo "    ufw status verbose                # правила фаервола"
-echo "    ausearch -k identity | tail -20   # последние события auditd"
-echo "    aa-status                         # статус AppArmor"
-echo "    bash ubuntu_hardening.sh --luks status   # шифрование"
+echo -e "  ${CYAN}Подключение:${NC} ssh -p ${APPLIED_SSH_PORT} ${APPLIED_ADMIN_USER}@<IP>"
+echo -e "  ${CYAN}Проверка в любой момент:${NC} sudo bash $0 --audit"
 echo ""
